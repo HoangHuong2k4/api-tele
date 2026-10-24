@@ -1,0 +1,24 @@
+bots: {}
+
+webhooks:
+  chuyen_tien_ve_bot:
+    url: "https://api.cataishop.shop/api/v1/webhooks/callback"
+    token: "5db0a2abdaeff6184cf6d5bc1c35f5a6"
+    conditions:
+      content_regex: ".*?"
+      account_regex: ".*?"
+
+gateways:
+  # mb_bank_1:
+  #   type: 'MBBANK'
+  #   password: '@@Hhuong2920'
+  #   account: '2902090904'
+  #   login_id: '0932507102'
+  #   repeat_interval_in_sec: 10
+
+  acb_bank_1:
+    type: "ACBBANK"
+    password: "Huong2902@@" 
+    account: "26031311"
+    login_id: "0932507102"
+    repeat_interval_in_sec: 10

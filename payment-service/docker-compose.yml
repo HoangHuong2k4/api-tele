@@ -1,0 +1,42 @@
+version: '3'
+volumes:
+  redis-data:
+    driver: local
+
+networks:
+  payment-network:
+    driver: bridge
+
+services:
+  app:
+    build: .
+    restart: always
+    volumes:
+      - ./.docker/config/config.yml:/app/config/config.yml
+      - ./state:/app/state
+    ports:
+      - 3006:3000
+    depends_on:
+      - redis
+      - captcha-resolver
+    environment:
+      - PORT=3000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CAPTCHA_API_BASE_URL=http://captcha-resolver:1234
+    networks:
+      - payment-network
+  redis:
+    image: redis:6.2-alpine
+    restart: always
+    volumes:
+      - redis-data:/data
+    networks:
+      - payment-network
+  captcha-resolver:
+    image: registry.gitlab.com/nhayhoc/bank-captcha-server:latest
+    restart: always
+    ports:
+      - 1234:1234
+    networks:
+      - payment-network
