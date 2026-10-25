@@ -170,7 +170,7 @@ class ApiProviderService {
                 const [updateResult]: any = await pool.execute(
                     `UPDATE ${TABLES.PRODUCTS}
                      SET api_stock = ?,
-                         api_sold = ?,
+                         api_sold = CASE WHEN ? > 0 THEN ? ELSE api_sold END,
                          api_cost_price = ?,
                          api_delivery_mode = ?,
                          price = CASE 
@@ -180,7 +180,7 @@ class ApiProviderService {
                          END,
                          updated_at = NOW()
                      WHERE api_provider_id = ? AND api_product_id = ? AND is_api_product = 1`,
-                    [stockCount, soldCount, costPrice, deliveryMode, costPrice, provider.id, apiProdId]
+                    [stockCount, soldCount, soldCount, costPrice, deliveryMode, costPrice, provider.id, apiProdId]
                 );
 
                 if (updateResult.affectedRows > 0) {
