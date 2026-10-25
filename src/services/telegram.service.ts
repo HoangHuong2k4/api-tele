@@ -229,7 +229,7 @@ class TelegramService {
         const sendSupportMsg = (ctx: any) => {
             const msg = `<tg-emoji emoji-id="5409376292720123855">📞</tg-emoji> <b>THÔNG TIN HỖ TRỢ</b>\n\n` +
                         `<tg-emoji emoji-id="6293971347596907631">👨‍💻</tg-emoji> <b>Admin chính:</b>\n` +
-                        `• Telegram: @ZeroBit2k4\n` +
+                        `• Telegram: @ZeroBit2k4 - @hiepgakio\n` +
                         `• Zalo: 0932507102\n` +
                         `• Hỗ trợ khi gặp lỗi hoặc cần tư vấn nạp/mua hàng.\n\n` +
                         `<tg-emoji emoji-id="5453957997418004470">👥</tg-emoji> <b>Nhóm cộng đồng:</b>\n` +
