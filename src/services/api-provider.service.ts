@@ -69,9 +69,32 @@ class ApiProviderService {
             if (!response.data) return;
 
             const data: any = response.data;
-            const productsList: any[] = Array.isArray(data)
-                ? data
-                : (data.data?.products || data.products || data.data || []);
+            let productsList: any[] = [];
+            if (Array.isArray(data)) {
+                productsList = data;
+            } else if (data.data?.products) {
+                if (Array.isArray(data.data.products)) {
+                    productsList = data.data.products;
+                } else if (typeof data.data.products === 'object') {
+                    productsList = Object.entries(data.data.products).map(([name, info]: [string, any]) => ({
+                        product_id: name,
+                        name: name,
+                        ...(typeof info === 'object' && info !== null ? info : { stock: info })
+                    }));
+                }
+            } else if (data.products) {
+                if (Array.isArray(data.products)) {
+                    productsList = data.products;
+                } else if (typeof data.products === 'object') {
+                    productsList = Object.entries(data.products).map(([name, info]: [string, any]) => ({
+                        product_id: name,
+                        name: name,
+                        ...(typeof info === 'object' && info !== null ? info : { stock: info })
+                    }));
+                }
+            } else if (Array.isArray(data.data)) {
+                productsList = data.data;
+            }
 
             if (!Array.isArray(productsList) || productsList.length === 0) {
                 return;
@@ -79,7 +102,7 @@ class ApiProviderService {
 
             let updatedCount = 0;
             for (const apiProd of productsList) {
-                const apiProdId = String(apiProd.product_id || apiProd.productId || apiProd.id || '').trim();
+                const apiProdId = String(apiProd.product_id || apiProd.productId || apiProd.id || apiProd.name || '').trim();
                 if (!apiProdId) continue;
 
                 let costPrice = 0;
@@ -183,6 +206,8 @@ class ApiProviderService {
                         balance = balData.balanceVnd;
                     } else if (typeof balData.amount !== 'undefined') {
                         balance = balData.amount;
+                    } else if (typeof balData.new_balance !== 'undefined') {
+                        balance = balData.new_balance;
                     }
                 }
             } catch {

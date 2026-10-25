@@ -6,3 +6,4 @@ package-lock.json
 *.log
 logs/
 .DS_Store
+payment-service/state/

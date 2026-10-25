@@ -1988,6 +1988,7 @@ class TelegramService {
                 try {
                     const reqBody: Record<string, any> = {
                         product_id: product.api_product_id,
+                        product_name: product.api_product_id,
                         quantity: totalAccNeeded,
                         partner_ref: orderCode,
                         request_id: orderCode,
@@ -2003,11 +2004,19 @@ class TelegramService {
                         }
                     );
                 } catch (apiErr: any) {
-                    logger.error(`[API Provider Order Error] ${orderUrl}: ${apiErr.response?.data?.detail || apiErr.response?.data?.message || apiErr.message}`);
+                    logger.error(`[API Provider Order Error] ${orderUrl}: ${apiErr.response?.data?.detail || apiErr.response?.data?.message || apiErr.response?.data?.error || apiErr.message}`);
                     const errDetail = apiErr.response?.data?.detail || apiErr.response?.data?.message || apiErr.response?.data?.error || apiErr.message;
+                    const rawErrStr = JSON.stringify(apiErr.response?.data || {});
+                    const isLowBalance = apiErr.response?.status === 402
+                        || String(errDetail).toLowerCase().includes('balance')
+                        || String(errDetail).toLowerCase().includes('số dư')
+                        || String(errDetail).toLowerCase().includes('không đủ tiền')
+                        || rawErrStr.toLowerCase().includes('balance')
+                        || rawErrStr.toLowerCase().includes('số dư');
+
                     if (apiErr.response?.status === 409) {
                         throw new Error(`Sản phẩm hiện đang tạm hết hàng, vui lòng thử lại sau.`);
-                    } else if (apiErr.response?.status === 402 || (apiErr.response?.status === 400 && String(errDetail).toLowerCase().includes('balance'))) {
+                    } else if (isLowBalance) {
                         this.notifyAdmin(tenantId, `⚠️ **THÔNG BÁO CẠN SỐ DƯ API KHO SỈ**\n\n- Khách: \`${userId}\` đang mua \`${product.name}\` (SL: ${totalAccNeeded})\n- Nhà cung cấp: \`${provider.name || provider.id}\`\n- Lỗi: ${errDetail}\n- Vui lòng nạp thêm tiền vào kho sỉ để đơn hàng API tiếp theo không bị lỗi.`);
                         throw new Error(`Hệ thống đang bận hoặc gián đoạn kết nối, vui lòng thử lại sau ít phút.`);
                     } else {
@@ -2073,7 +2082,7 @@ class TelegramService {
                     [tenantId, order.insertId, productId, totalAccNeeded, activePrice, comboId || null, bonusQty || null]
                 );
 
-                const balanceAfter = apiResp.data.payment?.balance ?? respData.payment?.balance ?? respData.balance;
+                const balanceAfter = apiResp.data.payment?.balance ?? respData.payment?.balance ?? respData.balance ?? respData.new_balance;
                 if (balanceAfter !== undefined && balanceAfter !== null) {
                     await conn.execute(
                         `UPDATE ${TABLES.API_PROVIDERS} SET balance = ? WHERE id = ?`,
