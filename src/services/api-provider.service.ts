@@ -1,7 +1,10 @@
 import axios from 'axios';
+import * as https from 'https';
 import pool from '../config/db';
 import { TABLES } from '../config/tables';
 import logger from '../config/logger';
+
+const ipv4HttpsAgent = new https.Agent({ family: 4, keepAlive: true });
 
 class ApiProviderService {
     private isSyncing = false;
@@ -62,9 +65,10 @@ class ApiProviderService {
 
             const response = await axios.get(catalogUrl, {
                 headers,
+                httpsAgent: ipv4HttpsAgent,
                 timeout: 15000,
                 params: requestParams
-            });
+            } as any);
 
             if (!response.data) return;
 
@@ -195,9 +199,10 @@ class ApiProviderService {
                 const balanceUrl = baseUrl + balanceEndpoint;
                 const balRes: any = await axios.get(balanceUrl, {
                     headers,
+                    httpsAgent: ipv4HttpsAgent,
                     params: { key: provider.api_key },
                     timeout: 8000
-                });
+                } as any);
                 const balData: any = balRes.data?.data || balRes.data;
                 if (balData) {
                     if (typeof balData.balance !== 'undefined') {
@@ -214,10 +219,10 @@ class ApiProviderService {
                 // Bỏ qua lỗi check balance
             }
 
-            // Cập nhật last_sync_at và balance cho provider
+            // Cập nhật last_sync_at, balance và raw_data cho provider
             await pool.execute(
-                `UPDATE ${TABLES.API_PROVIDERS} SET last_sync_at = NOW(), balance = ? WHERE id = ?`,
-                [balance, provider.id]
+                `UPDATE ${TABLES.API_PROVIDERS} SET last_sync_at = NOW(), balance = ?, raw_data = ? WHERE id = ?`,
+                [balance, JSON.stringify(data.data || data), provider.id]
             );
 
             if (updatedCount > 0) {

@@ -1985,25 +1985,48 @@ class TelegramService {
                 }
 
                 let apiResp: any = null;
-                try {
-                    const reqBody: Record<string, any> = {
-                        product_id: product.api_product_id,
-                        product_name: product.api_product_id,
-                        quantity: totalAccNeeded,
-                        partner_ref: orderCode,
-                        request_id: orderCode,
-                        key: provider.api_key,
-                    };
+                const reqBody: Record<string, any> = {
+                    product_id: product.api_product_id,
+                    product_name: product.api_product_id,
+                    quantity: totalAccNeeded,
+                    partner_ref: orderCode,
+                    request_id: orderCode,
+                    key: provider.api_key,
+                };
 
-                    apiResp = await axios.post(
-                        orderUrl,
-                        reqBody,
-                        {
-                            headers,
-                            timeout: 45000
+                const maxAttempts = 3;
+                let lastErr: any = null;
+
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    try {
+                        apiResp = await axios.post(
+                            orderUrl,
+                            reqBody,
+                            {
+                                headers,
+                                httpsAgent: ipv4HttpsAgent,
+                                timeout: 35000
+                            } as any
+                        );
+                        break;
+                    } catch (apiErr: any) {
+                        lastErr = apiErr;
+                        const isNetworkOrTimeout = !apiErr.response && (
+                            ['ECONNABORTED', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ERR_NETWORK'].includes(apiErr.code)
+                            || String(apiErr.message).includes('timeout')
+                            || String(apiErr.message).includes('connect')
+                        );
+                        if (isNetworkOrTimeout && attempt < maxAttempts) {
+                            logger.warn(`[API Provider Order] Lỗi kết nối lần ${attempt}/${maxAttempts} tới ${orderUrl}: ${apiErr.message}. Tự động thử lại sau 1s...`);
+                            await new Promise(r => setTimeout(r, 1000));
+                            continue;
                         }
-                    );
-                } catch (apiErr: any) {
+                        break;
+                    }
+                }
+
+                if (!apiResp && lastErr) {
+                    const apiErr = lastErr;
                     logger.error(`[API Provider Order Error] ${orderUrl}: ${apiErr.response?.data?.detail || apiErr.response?.data?.message || apiErr.response?.data?.error || apiErr.message}`);
                     const errDetail = apiErr.response?.data?.detail || apiErr.response?.data?.message || apiErr.response?.data?.error || apiErr.message;
                     const rawErrStr = JSON.stringify(apiErr.response?.data || {});
