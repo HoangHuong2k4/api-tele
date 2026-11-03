@@ -1988,9 +1988,12 @@ class TelegramService {
                 const reqBody: Record<string, any> = {
                     product_id: product.api_product_id,
                     product_name: product.api_product_id,
+                    product_key: product.api_product_id, // Lay2FA CTV API
                     quantity: totalAccNeeded,
+                    qty: totalAccNeeded, // Lay2FA CTV API
                     partner_ref: orderCode,
                     request_id: orderCode,
+                    order_code: orderCode, // Lay2FA CTV API
                     key: provider.api_key,
                 };
 
@@ -2027,18 +2030,22 @@ class TelegramService {
 
                 if (!apiResp && lastErr) {
                     const apiErr = lastErr;
-                    logger.error(`[API Provider Order Error] ${orderUrl}: ${apiErr.response?.data?.detail || apiErr.response?.data?.message || apiErr.response?.data?.error || apiErr.message}`);
-                    const errDetail = apiErr.response?.data?.detail || apiErr.response?.data?.message || apiErr.response?.data?.error || apiErr.message;
+                    const errDetail = apiErr.response?.data?.error || apiErr.response?.data?.detail || apiErr.response?.data?.message || apiErr.message;
+                    logger.error(`[API Provider Order Error] ${orderUrl}: ${errDetail}`);
                     const rawErrStr = JSON.stringify(apiErr.response?.data || {});
                     const isLowBalance = apiErr.response?.status === 402
                         || String(errDetail).toLowerCase().includes('balance')
                         || String(errDetail).toLowerCase().includes('số dư')
                         || String(errDetail).toLowerCase().includes('không đủ tiền')
+                        || String(errDetail).toLowerCase().includes('khong du so du')
                         || rawErrStr.toLowerCase().includes('balance')
-                        || rawErrStr.toLowerCase().includes('số dư');
+                        || rawErrStr.toLowerCase().includes('số dư')
+                        || rawErrStr.toLowerCase().includes('khong du so du');
 
-                    if (apiErr.response?.status === 409) {
+                    if (apiErr.response?.status === 409 || String(errDetail).toLowerCase().includes('khong du hang') || String(errDetail).toLowerCase().includes('hết hàng')) {
                         throw new Error(`Sản phẩm hiện đang tạm hết hàng, vui lòng thử lại sau.`);
+                    } else if (apiErr.response?.status === 503 || String(errDetail).toLowerCase().includes('tam ngung') || String(errDetail).toLowerCase().includes('tạm ngưng')) {
+                        throw new Error(`Sản phẩm hiện đang tạm ngưng bảo trì, vui lòng thử lại sau.`);
                     } else if (isLowBalance) {
                         this.notifyAdmin(tenantId, `⚠️ **THÔNG BÁO CẠN SỐ DƯ API KHO SỈ**\n\n- Khách: \`${userId}\` đang mua \`${product.name}\` (SL: ${totalAccNeeded})\n- Nhà cung cấp: \`${provider.name || provider.id}\`\n- Lỗi: ${errDetail}\n- Vui lòng nạp thêm tiền vào kho sỉ để đơn hàng API tiếp theo không bị lỗi.`);
                         throw new Error(`Hệ thống đang bận hoặc gián đoạn kết nối, vui lòng thử lại sau ít phút.`);
@@ -2052,6 +2059,14 @@ class TelegramService {
                 }
 
                 if (apiResp.data.success === false || apiResp.data.ok === false) {
+                    const errorMsg = apiResp.data.error || apiResp.data.message || apiResp.data.detail || 'Hệ thống đang bận';
+                    const isLowBalance = String(errorMsg).toLowerCase().includes('khong du so du') || String(errorMsg).toLowerCase().includes('số dư') || String(errorMsg).toLowerCase().includes('balance');
+                    if (isLowBalance) {
+                        this.notifyAdmin(tenantId, `⚠️ **THÔNG BÁO CẠN SỐ DƯ API KHO SỈ**\n\n- Khách: \`${userId}\` đang mua \`${product.name}\` (SL: ${totalAccNeeded})\n- Nhà cung cấp: \`${provider.name || provider.id}\`\n- Lỗi: ${errorMsg}\n- Vui lòng nạp thêm tiền vào kho sỉ để đơn hàng API tiếp theo không bị lỗi.`);
+                    }
+                    if (String(errorMsg).toLowerCase().includes('khong du hang') || String(errorMsg).toLowerCase().includes('hết hàng')) {
+                        throw new Error(`Sản phẩm hiện đang tạm hết hàng, vui lòng thử lại sau.`);
+                    }
                     throw new Error('Hệ thống đang bận hoặc gián đoạn kết nối, vui lòng thử lại sau ít phút.');
                 }
 
@@ -2105,7 +2120,7 @@ class TelegramService {
                     [tenantId, order.insertId, productId, totalAccNeeded, activePrice, comboId || null, bonusQty || null]
                 );
 
-                const balanceAfter = apiResp.data.payment?.balance ?? respData.payment?.balance ?? respData.balance ?? respData.new_balance;
+                const balanceAfter = apiResp.data.balance_remaining ?? respData.balance_remaining ?? apiResp.data.payment?.balance ?? respData.payment?.balance ?? respData.balance ?? respData.new_balance;
                 if (balanceAfter !== undefined && balanceAfter !== null) {
                     await conn.execute(
                         `UPDATE ${TABLES.API_PROVIDERS} SET balance = ? WHERE id = ?`,

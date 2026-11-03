@@ -73,6 +73,11 @@ class ApiProviderService {
             if (!response.data) return;
 
             const data: any = response.data;
+            let balance = provider.balance;
+            if (typeof data.balance !== 'undefined') {
+                balance = data.balance;
+            }
+
             let productsList: any[] = [];
             if (Array.isArray(data)) {
                 productsList = data;
@@ -82,7 +87,8 @@ class ApiProviderService {
                 } else if (typeof data.data.products === 'object') {
                     productsList = Object.entries(data.data.products).map(([name, info]: [string, any]) => ({
                         product_id: name,
-                        name: name,
+                        product_key: name,
+                        name: (typeof info === 'object' && info?.name) ? info.name : name,
                         ...(typeof info === 'object' && info !== null ? info : { stock: info })
                     }));
                 }
@@ -92,7 +98,8 @@ class ApiProviderService {
                 } else if (typeof data.products === 'object') {
                     productsList = Object.entries(data.products).map(([name, info]: [string, any]) => ({
                         product_id: name,
-                        name: name,
+                        product_key: name,
+                        name: (typeof info === 'object' && info?.name) ? info.name : name,
                         ...(typeof info === 'object' && info !== null ? info : { stock: info })
                     }));
                 }
@@ -106,7 +113,7 @@ class ApiProviderService {
 
             let updatedCount = 0;
             for (const apiProd of productsList) {
-                const apiProdId = String(apiProd.product_id || apiProd.productId || apiProd.id || apiProd.name || '').trim();
+                const apiProdId = String(apiProd.product_id || apiProd.product_key || apiProd.productId || apiProd.id || apiProd.name || '').trim();
                 if (!apiProdId) continue;
 
                 let costPrice = 0;
@@ -126,7 +133,10 @@ class ApiProviderService {
                     stockCount = isAvailable ? parseInt(apiProd.stock_count ?? apiProd.stock ?? apiProd.quantity ?? 0) : 0;
                     soldCount = parseInt(apiProd.sold ?? apiProd.sold_count ?? apiProd.sales ?? 0);
                 }
-                const deliveryMode = apiProd.delivery_mode || apiProd.productType || 'instant_items';
+                if (stockCount < 0) {
+                    stockCount = 0;
+                }
+                const deliveryMode = apiProd.delivery_mode || apiProd.productType || apiProd.type || 'instant_items';
 
                 // Kiểm tra xem sản phẩm có vừa lên hàng (từ hết hàng 0 lên >0) để thông báo
                 try {
@@ -193,7 +203,6 @@ class ApiProviderService {
             }
 
             // 2. Lấy số dư ví nhà cung cấp (nếu có endpoint)
-            let balance = provider.balance;
             try {
                 const balanceEndpoint = '/' + (provider.endpoint_balance || '/api/v2/me').replace(/^\/+/, '');
                 const balanceUrl = baseUrl + balanceEndpoint;
@@ -207,6 +216,8 @@ class ApiProviderService {
                 if (balData) {
                     if (typeof balData.balance !== 'undefined') {
                         balance = balData.balance;
+                    } else if (typeof balData.balance_remaining !== 'undefined') {
+                        balance = balData.balance_remaining;
                     } else if (typeof balData.balanceVnd !== 'undefined') {
                         balance = balData.balanceVnd;
                     } else if (typeof balData.amount !== 'undefined') {
