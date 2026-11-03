@@ -76,6 +76,8 @@ class ApiProviderService {
             let balance = provider.balance;
             if (typeof data.balance !== 'undefined') {
                 balance = data.balance;
+            } else if (typeof data.credit !== 'undefined') {
+                balance = data.credit;
             }
 
             let productsList: any[] = [];
@@ -105,6 +107,23 @@ class ApiProviderService {
                 }
             } else if (Array.isArray(data.data)) {
                 productsList = data.data;
+            }
+
+            // Hỗ trợ API chuyên biệt đơn lẻ (như Safe24 / Offer Pixel Bot qua /api/profile)
+            if (productsList.length === 0 && (typeof data.price !== 'undefined' || typeof data.credit !== 'undefined' || baseUrl.includes('apisafe24'))) {
+                const priceUsd = parseFloat(data.price || 1.2);
+                const priceVnd = Math.round(priceUsd * 26000);
+                productsList = [{
+                    product_id: 'offer_pixel_google_one',
+                    product_key: 'offer_pixel_google_one',
+                    name: 'Kích Hoạt Gói Google One 2TB (Pixel Offer)',
+                    price: priceVnd,
+                    cost_price: priceVnd,
+                    price_usd: priceUsd,
+                    stock: 999,
+                    available: true,
+                    delivery_mode: 'account_upgrade'
+                }];
             }
 
             if (!Array.isArray(productsList) || productsList.length === 0) {
@@ -216,6 +235,8 @@ class ApiProviderService {
                 if (balData) {
                     if (typeof balData.balance !== 'undefined') {
                         balance = balData.balance;
+                    } else if (typeof balData.credit !== 'undefined') {
+                        balance = balData.credit;
                     } else if (typeof balData.balance_remaining !== 'undefined') {
                         balance = balData.balance_remaining;
                     } else if (typeof balData.balanceVnd !== 'undefined') {

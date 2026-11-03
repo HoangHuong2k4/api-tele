@@ -106,5 +106,14 @@
   "qr_invoice_content": "📝 Nội dung: <code>{{desc}}</code>",
   "qr_invoice_note": "📌 <i>Quét mã để hoàn tất giao dịch tự động.</i>",
   "notify_stock_error": "⚠️ **THÔNG BÁO ĐƠN HÀNG**\n\nMã GD: `{{code}}`\nNội dung: {{name}} x {{qty}}\nTrạng thái: **Kẹt kho hoặc lỗi hệ thống.**\n\n📌 Hệ thống đã cộng tiền vào ví cho bạn. Vui lòng tự thực hiện lệnh mua qua /menu hoặc liên hệ Admin.",
-  "notify_purchase_error": "⚠️ **THÔNG BÁO ĐƠN HÀNG**\n\nMã GD: `{{code}}`\nNội dung: {{name}} x {{qty}}\nTrạng thái: **Lỗi xử lý tự động.** ({{error}})\n\n📌 Hệ thống đã cộng tiền vào ví cho bạn. Vui lòng tự thực hiện lệnh mua qua /menu hoặc liên hệ Admin."
+  "notify_purchase_error": "⚠️ **THÔNG BÁO ĐƠN HÀNG**\n\nMã GD: `{{code}}`\nNội dung: {{name}} x {{qty}}\nTrạng thái: **Lỗi xử lý tự động.** ({{error}})\n\n📌 Hệ thống đã cộng tiền vào ví cho bạn. Vui lòng tự thực hiện lệnh mua qua /menu hoặc liên hệ Admin.",
+  "btn_reinput_account": "🔄 Nhập lại tài khoản",
+  "account_upgrade_label": "📧 <b>Tài khoản nâng cấp:</b> <code>{{email}}</code>",
+  "account_upgrade_prompt": "\n<b>📝 NHẬP THÔNG TIN TÀI KHOẢN ĐỂ NÂNG CẤP:</b>\n\nVui lòng gửi tin nhắn theo định dạng:\n<code>Email | Mật khẩu | Mã 2FA (nếu có)</code>\n\n<i>Ví dụ:</i>\n<code>khachhang@gmail.com | MatKhau@123 | JBSWY3DPEHPK3PXP</code>\n<i>(Nếu tài khoản không có 2FA, chỉ cần gửi: <code>khachhang@gmail.com | MatKhau@123</code>)</i>",
+  "account_upgrade_missing_alert": "⚠️ <b>Sản phẩm này cần thông tin tài khoản để nâng cấp:</b>\n\nVui lòng gửi tin nhắn theo định dạng:\n<code>Email | Mật khẩu | Mã 2FA (nếu có)</code>",
+  "invalid_credentials_format": "❌ <b>Định dạng chưa đúng!</b>\n👉 Vui lòng gửi theo mẫu: <code>Email | Mật khẩu | Mã 2FA (nếu có)</code> (ngăn cách bởi dấu gạch đứng |)",
+  "invalid_email_or_pass": "❌ <b>Email hoặc mật khẩu không hợp lệ!</b>\nVui lòng kiểm tra và gửi lại theo định dạng:\n<code>Email | Mật khẩu | Mã 2FA (nếu có)</code>",
+  "account_received": "✅ <b>Đã nhận thông tin tài khoản:</b> <code>{{email}}</code>\nĐang tạo đơn xác nhận...",
+  "qr_upgrade_caption": "\n📧 <i>Tài khoản nâng cấp: <code>{{email}}</code></i>",
+  "job_delivery_msg": "🚀 <b>Đã gửi yêu cầu kích hoạt thành công!</b>\n📧 <b>Tài khoản:</b> <code>{{email}}</code>\n🆔 <b>Mã tiến trình (Job ID):</b> <code>{{jobId}}</code>\n📊 <b>Trạng thái:</b> <code>{{status}}</code>\n\n⏳ <i>Hệ thống tự động đang xử lý đơn hàng. Vui lòng giữ nguyên mật khẩu trong lúc kích hoạt gói!</i>"
 }

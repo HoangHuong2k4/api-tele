@@ -106,5 +106,14 @@
   "qr_invoice_content": "📝 Content: <code>{{desc}}</code>",
   "qr_invoice_note": "📌 <i>Scan QR code to complete the transaction automatically.</i>",
   "notify_stock_error": "⚠️ **ORDER NOTIFICATION**\n\nTX ID: `{{code}}`\nDetails: {{name}} x {{qty}}\nStatus: **Out of stock or System error.**\n\n📌 We have refunded the amount to your wallet. Please buy again using /menu or contact Admin.",
-  "notify_purchase_error": "⚠️ **ORDER NOTIFICATION**\n\nTX ID: `{{code}}`\nDetails: {{name}} x {{qty}}\nStatus: **Auto-purchase failed.** ({{error}})\n\n📌 We have refunded the amount to your wallet. Please buy again using /menu or contact Admin."
+  "notify_purchase_error": "⚠️ **ORDER NOTIFICATION**\n\nTX ID: `{{code}}`\nDetails: {{name}} x {{qty}}\nStatus: **Auto-purchase failed.** ({{error}})\n\n📌 We have refunded the amount to your wallet. Please buy again using /menu or contact Admin.",
+  "btn_reinput_account": "🔄 Re-enter account",
+  "account_upgrade_label": "📧 <b>Upgrade account:</b> <code>{{email}}</code>",
+  "account_upgrade_prompt": "\n<b>📝 ENTER ACCOUNT DETAILS TO UPGRADE:</b>\n\nPlease send your account information in the format:\n<code>Email | Password | 2FA Code (if any)</code>\n\n<i>Example:</i>\n<code>example@gmail.com | MyPass123 | JBSWY3DPEHPK3PXP</code>\n<i>(If your account does not have 2FA, simply send: <code>example@gmail.com | MyPass123</code>)</i>",
+  "account_upgrade_missing_alert": "⚠️ <b>This service requires account details for upgrading:</b>\n\nPlease send your information in the format:\n<code>Email | Password | 2FA Code (if any)</code>",
+  "invalid_credentials_format": "❌ <b>Invalid format!</b>\n👉 Please send as: <code>Email | Password | 2FA Code (if any)</code> (separated by vertical bar |)",
+  "invalid_email_or_pass": "❌ <b>Invalid email or password!</b>\nPlease check and re-send in the format:\n<code>Email | Password | 2FA Code (if any)</code>",
+  "account_received": "✅ <b>Received account details:</b> <code>{{email}}</code>\nCreating order confirmation...",
+  "qr_upgrade_caption": "\n📧 <i>Upgrade account: <code>{{email}}</code></i>",
+  "job_delivery_msg": "🚀 <b>Upgrade request submitted successfully!</b>\n📧 <b>Account:</b> <code>{{email}}</code>\n🆔 <b>Job ID:</b> <code>{{jobId}}</code>\n📊 <b>Status:</b> <code>{{status}}</code>\n\n⏳ <i>Automated system is processing your order. Please do not change your password during activation!</i>"
 }

@@ -17,6 +17,8 @@ const ipv4HttpsAgent = new https.Agent({ family: 4, keepAlive: true });
 interface UserState {
     step: string;
     productId?: string;
+    credentials?: string;
+    quantity?: number;
 }
 
 interface ComboInfo {
@@ -37,6 +39,7 @@ interface ComboInfo {
 class TelegramService {
     private bots: Map<number, { selling: Telegraf, notifying: Telegraf, adminId: string, token: string }> = new Map();
     private userStates: Map<string, UserState> = new Map();
+    private userCredentials: Map<string, string> = new Map();
 
     // Consolidated UI Elements
     private readonly UI = {
@@ -365,15 +368,46 @@ class TelegramService {
     private async dispatchText(ctx: any, next: () => Promise<void>) {
         const tgId = ctx.from.id.toString();
         const text = ctx.message.text?.trim();
-        if (!text || !/^\d+$/.test(text)) return next();
+        if (!text) return next();
 
         const state = this.userStates.get(tgId);
+        if (state?.step === 'AWAITING_ACCOUNT_CREDENTIALS' && state.productId) {
+            return this.handleAccountCredentialsInput(ctx, tgId, state.productId, text);
+        }
+
+        if (!/^\d+$/.test(text)) return next();
         const amount = parseInt(text);
 
         if (state?.step === 'AWAITING_QUANTITY') return this.handleQuantityInput(ctx, tgId, state.productId!, amount);
         if (amount >= 1000 && amount <= 500000000) return this.handleDirectDeposit(ctx, tgId, amount);
 
         return next();
+    }
+
+    private async handleAccountCredentialsInput(ctx: any, tgId: string, productId: string, text: string) {
+        const user = await this.getUser(ctx.tenantId, tgId);
+        const lang = user?.language || 'vi';
+
+        if (!text.includes('|')) {
+            return ctx.reply(i18n.t(lang, 'invalid_credentials_format'), { parse_mode: 'HTML' });
+        }
+
+        const parts = text.split('|').map(s => s.trim());
+        const email = parts[0];
+        const password = parts[1];
+
+        if (!email || !password || !email.includes('@')) {
+            return ctx.reply(i18n.t(lang, 'invalid_email_or_pass'), { parse_mode: 'HTML' });
+        }
+
+        const userIdKey = user ? user.id.toString() : tgId;
+
+        this.userCredentials.set(`${userIdKey}_${productId}`, text);
+        this.userCredentials.set(`${tgId}_${productId}`, text);
+        this.userStates.delete(tgId);
+
+        await ctx.reply(i18n.t(lang, 'account_received', { email }), { parse_mode: 'HTML' });
+        return this.handlePurchaseConfirmation(ctx, tgId, `confirm_${productId}_1`);
     }
 
     // --- Action Handlers: Wallet & Profile ---
@@ -570,12 +604,11 @@ class TelegramService {
     private async handlePurchaseInitiation(ctx: any, tgId: string, data: string) {
         try {
             const productId = data.split('_')[1];
-            this.userStates.set(tgId, { step: 'AWAITING_QUANTITY', productId });
 
             const user = await this.getUser(ctx.tenantId, tgId);
             const [prodRows] = await pool.execute(`
-                SELECT p.name, p.name_en, p.icon, p.description, p.description_en, p.price as retail_price,
-                       p.is_api_product, p.api_stock, p.api_sold,
+                SELECT p.name, p.name_en, p.icon, p.description, p.description_en, p.price as retail_price, p.price_usd,
+                       p.is_api_product, p.api_stock, p.api_sold, p.api_delivery_mode,
                        CASE WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 0 THEN pi.id END) END as stock,
                        CASE WHEN p.is_api_product = 1 THEN COALESCE(p.api_sold, 0) ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 1 THEN pi.id END) END as sold
                 FROM ${TABLES.PRODUCTS} p
@@ -694,6 +727,33 @@ class TelegramService {
             }
 
             let activeName = (lang === 'en' && product.name_en) ? product.name_en : product.name;
+
+            // Xử lý riêng cho sản phẩm dạng account_upgrade (yêu cầu khách gửi email|mật khẩu|2fa)
+            if (product.api_delivery_mode === 'account_upgrade') {
+                this.userStates.set(tgId, { step: 'AWAITING_ACCOUNT_CREDENTIALS', productId, quantity: 1 });
+
+                const upgradePrompt = i18n.t(lang, 'account_upgrade_prompt');
+
+                const upgradeMsg = `${productIconHtml}<b>${activeName}</b>\n` +
+                    priceHtml +
+                    descHtml +
+                    upgradePrompt;
+
+                const inlineRows = [
+                    [{ text: i18n.t(lang, 'btn_back'), callback_data: 'menu', icon_custom_emoji_id: '6086673312241424329' } as any]
+                ];
+                const keyboard = { inline_keyboard: inlineRows };
+
+                if (ctx.callbackQuery) {
+                    await ctx.answerCbQuery?.();
+                    return await ctx.editMessageText(upgradeMsg, { parse_mode: 'HTML', reply_markup: keyboard });
+                } else {
+                    return await ctx.reply(upgradeMsg, { parse_mode: 'HTML', reply_markup: keyboard });
+                }
+            }
+
+            this.userStates.set(tgId, { step: 'AWAITING_QUANTITY', productId });
+
             const msg = i18n.t(lang, 'selected_product', { icon: productIconHtml, name: activeName, stock: product.stock, sold: parseInt(product.sold) > 0 ? parseInt(product.sold).toLocaleString() : '0' }) +
                 priceHtml +
                 descHtml +
@@ -752,7 +812,7 @@ class TelegramService {
 
         const [prodRows] = await pool.execute(`
             SELECT p.name, p.name_en, p.icon, p.price as retail_price, p.price_usd,
-                   p.is_api_product, p.api_stock,
+                   p.is_api_product, p.api_stock, p.api_delivery_mode,
                    CASE WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(pi.id) END as stock 
             FROM ${TABLES.PRODUCTS} p 
             LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id 
@@ -769,6 +829,21 @@ class TelegramService {
 
         const product = prodRows[0];
         const stock = parseInt(product.stock);
+
+        const userCredKey = user ? `${user.id}_${productId}` : `${tgId}_${productId}`;
+        const credentials = this.userCredentials.get(userCredKey) || this.userCredentials.get(`${tgId}_${productId}`);
+
+        if (product.api_delivery_mode === 'account_upgrade' && !credentials) {
+            this.userStates.set(tgId, { step: 'AWAITING_ACCOUNT_CREDENTIALS', productId, quantity: 1 });
+            const promptMsg = i18n.t(lang, 'account_upgrade_missing_alert');
+            const kb = { inline_keyboard: [[{ text: i18n.t(lang, 'btn_back'), callback_data: 'menu' }]] };
+            if (ctx.callbackQuery) {
+                await ctx.answerCbQuery?.();
+                return await ctx.editMessageText(promptMsg, { parse_mode: 'HTML', reply_markup: kb });
+            } else {
+                return await ctx.reply(promptMsg, { parse_mode: 'HTML', reply_markup: kb });
+            }
+        }
 
         let activePrice = product.retail_price;
         let activePriceUsd = product.price_usd;
@@ -850,9 +925,16 @@ class TelegramService {
             totalUsd = totalUsd * (total / (activePrice * quantity));
         }
 
+        let accountUpgradeLine = '';
+        if (product.api_delivery_mode === 'account_upgrade' && credentials) {
+            const targetEmail = credentials.split('|')[0]?.trim();
+            accountUpgradeLine = `\n${i18n.t(lang, 'account_upgrade_label', { email: targetEmail })}\n`;
+        }
+
         const priceLineText = isDealerPrice ? (lang === 'en' ? ' <i>(Reseller Price)</i>' : ' <i>(Giá CTV)</i>') : '';
         const msg = `${i18n.t(lang, 'confirm_order_title')}\n\n` +
             `${i18n.t(lang, 'confirm_product', { icon: productIconHtml, name: pName })}\n` +
+            accountUpgradeLine +
             `${bonusQty > 0 ? i18n.t(lang, 'confirm_qty_bonus', { qty: quantity, bonus: bonusQty, actual: actualQty }) : i18n.t(lang, 'confirm_qty', { qty: quantity })}\n` +
             comboLine +
             `\n${i18n.t(lang, 'confirm_total', { total: this.fmt(total) + 'đ ($' + totalUsd.toFixed(2) + ')', dealer: priceLineText })}\n\n` +
@@ -865,7 +947,11 @@ class TelegramService {
         }
         buttons.push([{ text: i18n.t(lang, 'pay_qr'), callback_data: `genqr_${total}_${productId}_${quantity}${comboParam}` }]);
         buttons.push([{ text: i18n.t(lang, 'pay_usdt'), callback_data: `genusdt_${total}_${productId}_${quantity}${comboParam}` }]);
-        buttons.push([{ text: i18n.t(lang, 'change_qty'), callback_data: `buy_${productId}`, icon_custom_emoji_id: '6086673312241424329' } as any]);
+        if (product.api_delivery_mode === 'account_upgrade') {
+            buttons.push([{ text: i18n.t(lang, 'btn_reinput_account'), callback_data: `buy_${productId}`, icon_custom_emoji_id: '6086673312241424329' } as any]);
+        } else {
+            buttons.push([{ text: i18n.t(lang, 'change_qty'), callback_data: `buy_${productId}`, icon_custom_emoji_id: '6086673312241424329' } as any]);
+        }
         buttons.push([{ text: i18n.t(lang, 'cancel_order'), callback_data: 'menu' }]);
 
         this.safeAnswerCb(ctx);
@@ -924,10 +1010,16 @@ class TelegramService {
         const userBalance = parseFloat(user.balance || '0');
         if (userBalance < total) return this.safeAnswerCb(ctx, 'Số dư không đủ.', { show_alert: true });
 
+        const userCredKey = `${user.id}_${productId}`;
+        const credentials = this.userCredentials.get(userCredKey) || this.userCredentials.get(`${tgId}_${productId}`);
+
         this.safeAnswerCb(ctx, '🚀 Đang xử lý thanh toán...');
-        const result = await this.handleDirectPurchase(ctx.tenantId, user.id, productId, quantity, undefined, bonusQty, selectedComboId, `tg_${tgId}`);
+        const result = await this.handleDirectPurchase(ctx.tenantId, user.id, productId, quantity, undefined, bonusQty, selectedComboId, `tg_${tgId}`, credentials);
 
         if (result.success) {
+            this.userCredentials.delete(userCredKey);
+            this.userCredentials.delete(`${tgId}_${productId}`);
+
             await this.sendSuccessDelivery({
                 ctx,
                 tenantId: ctx.tenantId,
@@ -945,7 +1037,7 @@ class TelegramService {
             const itemsFormatted = result.items.map((item: string) => {
                 return item.split('\n').map(line => {
                     const trimmed = line.trim();
-                    if (trimmed.startsWith('http')) return trimmed;
+                    if (trimmed.startsWith('http') || trimmed.includes('<') || trimmed.includes('>')) return trimmed;
                     return `<code>${trimmed}</code>`;
                 }).join('\n');
             }).join('\n');
@@ -995,7 +1087,7 @@ class TelegramService {
         const formattedItems = data.items.map(item => {
             return item.split('\n').map(line => {
                 const trimmed = line.trim();
-                if (trimmed.startsWith('http')) return trimmed;
+                if (trimmed.startsWith('http') || trimmed.includes('<') || trimmed.includes('>')) return trimmed;
                 return `<code>${trimmed}</code>`;
             }).join('\n');
         });
@@ -1255,16 +1347,20 @@ class TelegramService {
             const code = this.genId();
             const desc = code;
 
-            // Lưu deposit_request kèm combo_id và bonus_qty
+            const userCredKey = user ? `${user.id}_${productId}` : `${tgId}_${productId}`;
+            const credentials = productId ? (this.userCredentials.get(userCredKey) || this.userCredentials.get(`${tgId}_${productId}`)) : undefined;
+
+            // Lưu deposit_request kèm combo_id, bonus_qty và credentials
             await pool.execute(
-                `INSERT INTO ${TABLES.DEPOSIT_REQUESTS} (tenant_id, customer_id, product_id, quantity, combo_id, bonus_qty, amount, payment_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [ctx.tenantId, user.id, productId, qty, comboId, bonusQty || null, amount, code]
+                `INSERT INTO ${TABLES.DEPOSIT_REQUESTS} (tenant_id, customer_id, product_id, quantity, combo_id, bonus_qty, amount, payment_code, credentials) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [ctx.tenantId, user.id, productId, qty, comboId, bonusQty || null, amount, code, credentials || null]
             );
 
             await ctx.answerCbQuery?.('🚀 Đang gửi mã QR...');
 
             // Dòng thông tin combo trong caption QR
             const comboCaption = bonusQty > 0 ? `\n<tg-emoji emoji-id="5445408903670022363">🎁</tg-emoji> <i>Combo: Tặng ${bonusQty} acc (nhận ${qty + bonusQty} acc)</i>` : '';
+            const upgradeCaption = credentials ? i18n.t(lang, 'qr_upgrade_caption', { email: credentials.split('|')[0]?.trim() }) : '';
 
             const config = ctx.config;
             const bankNum = config?.bank_num || '';
@@ -1285,7 +1381,7 @@ class TelegramService {
             await this.sendPhotoWithFallback(ctx, this.qr(ctx, amount, desc), {
                 caption: [
                     i18n.t(lang, 'qr_invoice_title', { type: productId ? i18n.t(lang, 'qr_invoice_buy') : i18n.t(lang, 'qr_invoice_deposit') }),
-                    i18n.t(lang, 'qr_invoice_money', { amount: this.fmt(amount), dealer: isDealerPrice ? i18n.t(lang, 'qr_invoice_dealer') : '', combo: comboCaption }),
+                    i18n.t(lang, 'qr_invoice_money', { amount: this.fmt(amount), dealer: isDealerPrice ? i18n.t(lang, 'qr_invoice_dealer') : '', combo: comboCaption + upgradeCaption }),
                     i18n.t(lang, 'qr_invoice_content', { desc: desc }),
                     '',
                     i18n.t(lang, 'qr_invoice_note')
@@ -1510,9 +1606,12 @@ class TelegramService {
                 }
             }
 
+            const userCredKey = user ? `${user.id}_${productId}` : `${tgId}_${productId}`;
+            const credentials = productId ? (this.userCredentials.get(userCredKey) || this.userCredentials.get(`${tgId}_${productId}`)) : undefined;
+
             await pool.execute(
-                `INSERT INTO ${TABLES.DEPOSIT_REQUESTS} (tenant_id, customer_id, product_id, quantity, combo_id, amount, usdt_amount, payment_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [ctx.tenantId, user.id, productId, qty, comboId, amountVnd, usdtAmount, code]
+                `INSERT INTO ${TABLES.DEPOSIT_REQUESTS} (tenant_id, customer_id, product_id, quantity, combo_id, amount, usdt_amount, payment_code, credentials) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [ctx.tenantId, user.id, productId, qty, comboId, amountVnd, usdtAmount, code, credentials || null]
             );
 
             await ctx.answerCbQuery?.(i18n.t(lang, 'creating_usdt_order'));
@@ -1902,12 +2001,14 @@ class TelegramService {
         paymentCode?: string,
         bonusQty: number = 0,
         comboId?: number,
-        reservedBy?: string  // Key reservation để ưu tiên lấy slot đã giữ
+        reservedBy?: string,  // Key reservation để ưu tiên lấy slot đã giữ
+        credentials?: string
     ) {
         const conn = await pool.getConnection();
         try {
             await conn.beginTransaction();
-            const [u] = await conn.execute(`SELECT balance, is_dealer FROM ${TABLES.CUSTOMERS} WHERE id = ? AND tenant_id = ? FOR UPDATE`, [userId, tenantId]) as any;
+            const [u] = await conn.execute(`SELECT balance, is_dealer, language FROM ${TABLES.CUSTOMERS} WHERE id = ? AND tenant_id = ? FOR UPDATE`, [userId, tenantId]) as any;
+            const lang = u[0]?.language || 'vi';
             const [prodRows]: any = await conn.execute(`SELECT name, price, is_api_product, api_provider_id, api_product_id, api_stock, api_delivery_mode FROM ${TABLES.PRODUCTS} WHERE id = ? AND tenant_id = ?`, [productId, tenantId]);
             if (!prodRows || prodRows.length === 0) throw new Error('Không tìm thấy sản phẩm');
             const product = prodRows[0];
@@ -1968,6 +2069,20 @@ class TelegramService {
                 }
                 const provider = providers[0];
 
+                // Tìm credentials nếu là đơn nâng cấp tài khoản
+                if (!credentials && paymentCode) {
+                    const [depRows]: any = await conn.execute(
+                        `SELECT credentials FROM ${TABLES.DEPOSIT_REQUESTS} WHERE payment_code = ? AND tenant_id = ? LIMIT 1`,
+                        [paymentCode, tenantId]
+                    );
+                    if (depRows?.[0]?.credentials) {
+                        credentials = depRows[0].credentials;
+                    }
+                }
+                if (!credentials) {
+                    credentials = this.userCredentials.get(`${userId}_${productId}`);
+                }
+
                 const orderCode = paymentCode || ('API' + Math.random().toString(36).substring(2, 8).toUpperCase());
                 const endpoint = provider.endpoint_orders || '/api/v2/orders';
                 const orderUrl = provider.base_url.replace(/\/+$/, '') + '/' + endpoint.replace(/^\/+/, '');
@@ -1996,6 +2111,18 @@ class TelegramService {
                     order_code: orderCode, // Lay2FA CTV API
                     key: provider.api_key,
                 };
+
+                // Hỗ trợ API Create Job chạy tài khoản (Safe24 / Google One / Offer Pixel)
+                if (orderUrl.includes('jobs/create') || provider.base_url.includes('apisafe24') || product.api_delivery_mode === 'account_upgrade') {
+                    if (credentials) {
+                        const parts = credentials.split('|').map((s: string) => s.trim());
+                        reqBody.email = parts[0] || '';
+                        reqBody.password = parts[1] || '';
+                        reqBody.totp_secret = parts[2] || '';
+                    } else {
+                        throw new Error('Thiếu thông tin tài khoản (Email | Mật khẩu) để thực hiện nâng cấp.');
+                    }
+                }
 
                 const maxAttempts = 3;
                 let lastErr: any = null;
@@ -2071,12 +2198,17 @@ class TelegramService {
                 }
 
                 const respData = apiResp.data.data || apiResp.data.order || apiResp.data;
-                const apiOrderCode = respData.order_code || respData.orderCode || apiResp.data.order?.orderCode || respData.order_id || respData.id || respData.request_id || null;
+                const apiOrderCode = respData.job_id || apiResp.data.job_id || respData.order_code || respData.orderCode || apiResp.data.order?.orderCode || respData.order_id || respData.id || respData.request_id || null;
                 const apiStatus = respData.status || apiResp.data.order?.status || 'done';
                 const apiItemsRaw = apiResp.data.delivery?.accounts || respData.delivery?.accounts || respData.items || respData.accounts || respData.cards || [];
                 const results: string[] = [];
 
-                if (Array.isArray(apiItemsRaw) && apiItemsRaw.length > 0) {
+                if (respData.job_id || apiResp.data.job_id) {
+                    const jobId = respData.job_id || apiResp.data.job_id;
+                    const parts = (credentials || '').split('|').map((s: string) => s.trim());
+                    const targetEmail = parts[0] || '';
+                    results.push(i18n.t(lang, 'job_delivery_msg', { email: targetEmail, jobId, status: apiStatus }));
+                } else if (Array.isArray(apiItemsRaw) && apiItemsRaw.length > 0) {
                     for (const item of apiItemsRaw) {
                         if (typeof item === 'object' && item !== null) {
                             if (item.user && item.password) {
@@ -2120,7 +2252,7 @@ class TelegramService {
                     [tenantId, order.insertId, productId, totalAccNeeded, activePrice, comboId || null, bonusQty || null]
                 );
 
-                const balanceAfter = apiResp.data.balance_remaining ?? respData.balance_remaining ?? apiResp.data.payment?.balance ?? respData.payment?.balance ?? respData.balance ?? respData.new_balance;
+                const balanceAfter = apiResp.data.credit ?? respData.credit ?? apiResp.data.balance_remaining ?? respData.balance_remaining ?? apiResp.data.payment?.balance ?? respData.payment?.balance ?? respData.balance ?? respData.new_balance;
                 if (balanceAfter !== undefined && balanceAfter !== null) {
                     await conn.execute(
                         `UPDATE ${TABLES.API_PROVIDERS} SET balance = ? WHERE id = ?`,
@@ -2132,6 +2264,14 @@ class TelegramService {
                     `UPDATE ${TABLES.PRODUCTS} SET api_stock = GREATEST(0, api_stock - ?) WHERE id = ?`,
                     [totalAccNeeded, productId]
                 );
+
+                for (const res of results) {
+                    await conn.execute(
+                        `INSERT INTO ${TABLES.PRODUCT_ITEMS} (tenant_id, product_id, content, is_sold, customer_id, order_id, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, NOW(), NOW())`,
+                        [tenantId, productId, res, userId, order.insertId]
+                    );
+                }
+                this.userCredentials.delete(`${userId}_${productId}`);
 
                 await conn.commit();
                 return { success: true, items: results, remainingBalance: newBalance, orderId: order.insertId, code: orderCode, bonusQty };
@@ -2677,7 +2817,7 @@ class TelegramService {
                 const itemsFormatted = result.items.map((item: string) => {
                     return item.split('\n').map(line => {
                         const trimmed = line.trim();
-                        if (trimmed.startsWith('http')) return trimmed;
+                        if (trimmed.startsWith('http') || trimmed.includes('<') || trimmed.includes('>')) return trimmed;
                         return `<code>${trimmed}</code>`;
                     }).join('\n');
                 }).join('\n');
