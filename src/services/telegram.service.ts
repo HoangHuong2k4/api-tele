@@ -654,9 +654,9 @@ class TelegramService {
             const user = await this.getUser(ctx.tenantId, tgId);
             const [prodRows] = await pool.execute(`
                 SELECT p.name, p.name_en, p.icon, p.description, p.description_en, p.price as retail_price, p.price_usd,
-                       p.is_api_product, p.api_stock, p.api_sold, p.api_delivery_mode,
-                       CASE WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 0 THEN pi.id END) END as stock,
-                       CASE WHEN p.is_api_product = 1 THEN COALESCE(p.api_sold, 0) ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 1 THEN pi.id END) END as sold
+                       p.is_api_product, p.api_stock, p.api_sold, p.api_delivery_mode, p.is_unlimited,
+                       CASE WHEN p.is_unlimited = 1 THEN 999999 WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 0 THEN pi.id END) END as stock,
+                       CASE WHEN p.is_api_product = 1 THEN COALESCE(p.api_sold, 0) ELSE GREATEST(COALESCE(p.api_sold, 0), COUNT(DISTINCT CASE WHEN pi.is_sold = 1 THEN pi.id END)) END as sold
                 FROM ${TABLES.PRODUCTS} p
                 LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id AND pi.tenant_id = p.tenant_id
                 WHERE p.id = ? AND p.tenant_id = ?
@@ -800,7 +800,7 @@ class TelegramService {
 
             this.userStates.set(tgId, { step: 'AWAITING_QUANTITY', productId });
 
-            const msg = i18n.t(lang, 'selected_product', { icon: productIconHtml, name: activeName, stock: product.stock, sold: parseInt(product.sold) > 0 ? parseInt(product.sold).toLocaleString() : '0' }) +
+            const msg = i18n.t(lang, 'selected_product', { icon: productIconHtml, name: activeName, stock: product.is_unlimited === 1 ? '∞' : product.stock, sold: parseInt(product.sold) > 0 ? parseInt(product.sold).toLocaleString() : '0' }) +
                 priceHtml +
                 descHtml +
                 comboHtml +
@@ -858,8 +858,8 @@ class TelegramService {
 
         const [prodRows] = await pool.execute(`
             SELECT p.name, p.name_en, p.icon, p.price as retail_price, p.price_usd,
-                   p.is_api_product, p.api_stock, p.api_delivery_mode,
-                   CASE WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(pi.id) END as stock 
+                   p.is_api_product, p.api_stock, p.api_delivery_mode, p.is_unlimited,
+                   CASE WHEN p.is_unlimited = 1 THEN 999999 WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(pi.id) END as stock 
             FROM ${TABLES.PRODUCTS} p 
             LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id 
                 AND pi.is_sold = 0
@@ -921,7 +921,7 @@ class TelegramService {
         }
 
         // === TẠM GIỮ SLOT cho thanh toán Ví (5 phút) ===
-        if (user) {
+        if (user && !product.is_unlimited && !product.is_api_product) {
             await this.reserveStock(ctx.tenantId, parseInt(productId), actualQty, `tg_${tgId}`, 5);
         }
 
@@ -1381,9 +1381,11 @@ class TelegramService {
                 }
 
                 const totalNeeded = qty + bonusQty;
-                const [pRowCheck]: any = await pool.execute(`SELECT is_api_product, api_stock FROM ${TABLES.PRODUCTS} WHERE id = ? AND tenant_id = ?`, [productId, ctx.tenantId]);
+                const [pRowCheck]: any = await pool.execute(`SELECT is_api_product, api_stock, is_unlimited FROM ${TABLES.PRODUCTS} WHERE id = ? AND tenant_id = ?`, [productId, ctx.tenantId]);
                 let availableStock = 0;
-                if (pRowCheck?.[0]?.is_api_product === 1) {
+                if (pRowCheck?.[0]?.is_unlimited === 1) {
+                    availableStock = 999999;
+                } else if (pRowCheck?.[0]?.is_api_product === 1) {
                     availableStock = parseInt(pRowCheck[0].api_stock || 0);
                 } else {
                     const [stockCheck]: any = await pool.execute(`
@@ -1405,7 +1407,9 @@ class TelegramService {
                 if (dealerRows && dealerRows.length > 0) isDealerPrice = true;
 
                 // === TẠM GIỮ SLOT cho QR (5 phút) ===
-                await this.reserveStock(ctx.tenantId, parseInt(productId), totalNeeded, `qr_${user.id}`, 5);
+                if (!pRowCheck?.[0]?.is_unlimited && !pRowCheck?.[0]?.is_api_product) {
+                    await this.reserveStock(ctx.tenantId, parseInt(productId), totalNeeded, `qr_${user.id}`, 5);
+                }
             }
 
             const code = this.genId();
@@ -1650,9 +1654,11 @@ class TelegramService {
                 const bonusCheck = comboRowsCheck?.[0]?.bonus_qty || 0;
                 const totalNeededUsdt = qty + bonusCheck;
                 // Check stock available before reserve
-                const [pRowUsdt]: any = await pool.execute(`SELECT is_api_product, api_stock FROM ${TABLES.PRODUCTS} WHERE id = ? AND tenant_id = ?`, [productId, ctx.tenantId]);
+                const [pRowUsdt]: any = await pool.execute(`SELECT is_api_product, api_stock, is_unlimited FROM ${TABLES.PRODUCTS} WHERE id = ? AND tenant_id = ?`, [productId, ctx.tenantId]);
                 let availableStockUsdt = 0;
-                if (pRowUsdt?.[0]?.is_api_product === 1) {
+                if (pRowUsdt?.[0]?.is_unlimited === 1) {
+                    availableStockUsdt = 999999;
+                } else if (pRowUsdt?.[0]?.is_api_product === 1) {
                     availableStockUsdt = parseInt(pRowUsdt[0].api_stock || 0);
                 } else {
                     const [stockCheckUsdt]: any = await pool.execute(
@@ -1665,7 +1671,7 @@ class TelegramService {
                     const lang2 = user?.language || 'vi';
                     return this.safeAnswerCb(ctx, i18n.t(lang2, 'error_just_out', { stock: availableStockUsdt, needed: totalNeededUsdt }), { show_alert: true });
                 }
-                if (!pRowUsdt?.[0]?.is_api_product) {
+                if (!pRowUsdt?.[0]?.is_api_product && !pRowUsdt?.[0]?.is_unlimited) {
                     await this.reserveStock(ctx.tenantId, parseInt(productId), totalNeededUsdt, `usdt_${user.id}`, 5);
                 }
             }
@@ -1743,8 +1749,8 @@ class TelegramService {
 
         const [rows] = await pool.execute(`
             SELECT p.id, p.name, p.name_en, p.icon, p.price as retail_price, p.price_usd,
-                   p.is_api_product, p.api_stock,
-                   CASE WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 0 THEN pi.id END) END as stock
+                   p.is_api_product, p.api_stock, p.is_unlimited,
+                   CASE WHEN p.is_unlimited = 1 THEN 999999 WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 0 THEN pi.id END) END as stock
             FROM ${TABLES.PRODUCTS} p
             LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id AND pi.tenant_id = p.tenant_id
             WHERE p.status = 'published' AND p.tenant_id = ?
@@ -1773,7 +1779,7 @@ class TelegramService {
                 const pName = lang === 'en' && p.name_en ? p.name_en : p.name;
 
                 // Lấy thông tin kho
-                const statusText = isOutOfStock ? i18n.t(lang, 'out_of_stock_status') : i18n.t(lang, 'stock_status', { stock: p.stock });
+                const statusText = isOutOfStock ? i18n.t(lang, 'out_of_stock_status') : i18n.t(lang, 'stock_status', { stock: p.is_unlimited === 1 ? '∞' : p.stock });
                 
                 // Tự động gán icon dự phòng nếu DB trống (Dùng icon giỏ hàng Premium làm mặc định)
                 let fallbackIcon = isOutOfStock ? '5210952531676504517' : '5312361253610475399';
@@ -2107,7 +2113,7 @@ class TelegramService {
             await conn.beginTransaction();
             const [u] = await conn.execute(`SELECT balance, is_dealer, language FROM ${TABLES.CUSTOMERS} WHERE id = ? AND tenant_id = ? FOR UPDATE`, [userId, tenantId]) as any;
             const lang = u[0]?.language || 'vi';
-            const [prodRows]: any = await conn.execute(`SELECT name, price, is_api_product, api_provider_id, api_product_id, api_stock, api_delivery_mode FROM ${TABLES.PRODUCTS} WHERE id = ? AND tenant_id = ?`, [productId, tenantId]);
+            const [prodRows]: any = await conn.execute(`SELECT name, price, is_api_product, api_provider_id, api_product_id, api_stock, api_delivery_mode, is_unlimited, delivery_message FROM ${TABLES.PRODUCTS} WHERE id = ? AND tenant_id = ?`, [productId, tenantId]);
             if (!prodRows || prodRows.length === 0) throw new Error('Không tìm thấy sản phẩm');
             const product = prodRows[0];
 
@@ -2382,6 +2388,46 @@ class TelegramService {
 
                 await conn.commit();
                 return { success: true, items: results, remainingBalance: newBalance, orderId: order.insertId, code: orderCode, bonusQty };
+            }
+
+            // --- XỬ LÝ SẢN PHẨM VÔ HẠN SỐ LƯỢNG (LIÊN HỆ ADMIN / KỊCH BẢN TRẢ SẴN) ---
+            if (product.is_unlimited === 1) {
+                const newBalance = parseFloat(u[0].balance) - total;
+                await conn.execute(`UPDATE ${TABLES.CUSTOMERS} SET balance = ? WHERE id = ? AND tenant_id = ?`, [newBalance, userId, tenantId]);
+
+                const orderCode = paymentCode || ('WL' + Math.random().toString(36).substring(2, 8).toUpperCase());
+
+                const [order] = await conn.execute(
+                    `INSERT INTO telehub_orders (tenant_id, customer_id, code, total_amount, status, created_at, updated_at) VALUES (?, ?, ?, ?, "completed", NOW(), NOW())`,
+                    [tenantId, userId, orderCode, total]
+                ) as any;
+
+                const bonusSuffix = bonusQty > 0 ? ` (tặng ${bonusQty})` : '';
+                const noteText = paymentCode
+                    ? `Mua ${quantity}${bonusSuffix} x ${product.name} [${paymentCode}]`
+                    : `Mua ${quantity}${bonusSuffix} x ${product.name}`;
+                await conn.execute(
+                    `INSERT INTO ${TABLES.BALANCE_LOGS} (tenant_id, customer_id, order_id, amount, type, note, created_at, updated_at) VALUES (?, ?, ?, ?, "OUT", ?, NOW(), NOW())`,
+                    [tenantId, userId, order.insertId, total, noteText]
+                );
+
+                const customMsg = (product.delivery_message || '').trim();
+                const finalDeliveryText = customMsg || 'Liên hệ admin để được hỗ trợ sản phẩm';
+
+                for (let idx = 0; idx < totalAccNeeded; idx++) {
+                    await conn.execute(
+                        `INSERT INTO ${TABLES.PRODUCT_ITEMS} (tenant_id, product_id, username, content, is_sold, customer_id, order_id, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, NOW(), NOW())`,
+                        [tenantId, productId, finalDeliveryText, finalDeliveryText, userId, order.insertId]
+                    );
+                }
+
+                await conn.execute(
+                    `INSERT INTO telehub_order_details (tenant_id, order_id, product_id, quantity, price, combo_id, bonus_qty, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+                    [tenantId, order.insertId, productId, totalAccNeeded, activePrice, comboId || null, bonusQty || null]
+                );
+
+                await conn.commit();
+                return { success: true, items: [finalDeliveryText], remainingBalance: newBalance, orderId: order.insertId, code: orderCode, bonusQty };
             }
 
             // Lấy item đã reserved trước (ưu tiên), sau đó mới lấy slot chưa reserved

@@ -42,7 +42,7 @@ router.get('/stock', async (req, res) => {
 
         // Lấy danh sách sản phẩm (chỉ lấy các sản phẩm published)
         const [products]: any = await pool.execute(`
-            SELECT p.id, p.name, p.price, p.price_usd, p.status, p.is_api_product, p.api_stock 
+            SELECT p.id, p.name, p.price, p.price_usd, p.status, p.is_api_product, p.api_stock, p.is_unlimited 
             FROM ${TABLES.PRODUCTS} p
             WHERE p.tenant_id = ? AND p.status = 'published'
         `, [tenantId]);
@@ -68,7 +68,7 @@ router.get('/stock', async (req, res) => {
         const resultProducts: Record<string, any> = {};
 
         for (const p of products) {
-            const stock = p.is_api_product === 1 ? (p.api_stock || 0) : (stockMap.get(p.id) || 0);
+            const stock = p.is_unlimited === 1 ? 999999 : (p.is_api_product === 1 ? (p.api_stock || 0) : (stockMap.get(p.id) || 0));
             const dp: any = priceMap.get(p.id);
             const price = (dp && dp.price !== null && dp.price !== undefined) ? dp.price : p.price;
             const priceUsd = (dp && dp.price_usd !== null && dp.price_usd !== undefined) ? dp.price_usd : p.price_usd;
