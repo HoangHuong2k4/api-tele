@@ -45,11 +45,17 @@ setInterval(() => {
     apiProviderService.syncAllProviders();
 }, 30000);
 
+// Polling API async jobs status every 20 seconds
+setInterval(() => {
+    apiProviderService.checkPendingJobs();
+}, 20000);
+
 // Initial tasks
 bankService.cleanupExpiredRequests();
 bankService.syncAllBanks();
 cryptoService.syncAllBinance();
 apiProviderService.syncAllProviders();
+apiProviderService.checkPendingJobs();
 
 import adminRoutes from './routes/admin.routes';
 

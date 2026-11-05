@@ -3,6 +3,7 @@ import * as https from 'https';
 import pool from '../config/db';
 import { TABLES } from '../config/tables';
 import logger from '../config/logger';
+import { telegramService } from './telegram.service';
 
 const ipv4HttpsAgent = new https.Agent({ family: 4, keepAlive: true });
 
@@ -262,6 +263,267 @@ class ApiProviderService {
             }
         } catch (err: any) {
             logger.warn(`[ApiProviderSync] Lỗi đồng bộ provider #${provider.id}: ${err.message}`);
+        }
+    }
+
+    private isCheckingJobs = false;
+
+    /**
+     * Tự động kiểm tra trạng thái các đơn hàng API bất đồng bộ (như Safe24 Google One / Pixel Offer)
+     */
+    public async checkPendingJobs(): Promise<void> {
+        if (this.isCheckingJobs) return;
+        this.isCheckingJobs = true;
+
+        try {
+            // Lấy các đơn hàng API đang ở trạng thái chờ hoặc đang xử lý
+            const [orders]: any = await pool.execute(`
+                SELECT o.id, o.code, o.tenant_id, o.customer_id, o.api_provider_id, o.api_order_code, 
+                       o.api_status, o.api_response, o.created_at,
+                       p.base_url, p.auth_type, p.header_name, p.api_key
+                FROM ${TABLES.ORDERS} o
+                JOIN ${TABLES.API_PROVIDERS} p ON p.id = o.api_provider_id
+                WHERE o.api_order_code IS NOT NULL
+                  AND o.api_status IN ('queued', 'pending', 'processing')
+                  AND o.created_at >= NOW() - INTERVAL 48 HOUR
+                ORDER BY o.id ASC
+                LIMIT 30
+            `);
+
+            if (!orders || orders.length === 0) return;
+
+            for (const order of orders) {
+                await this.checkSingleJobStatus(order);
+            }
+        } catch (error: any) {
+            logger.error(`[JobStatusCheck] Lỗi kiểm tra tiến trình: ${error.message}`);
+        } finally {
+            this.isCheckingJobs = false;
+        }
+    }
+
+    /**
+     * Kiểm tra và cập nhật trạng thái của 1 Job cụ thể
+     */
+    public async checkSingleJobStatus(order: any): Promise<any> {
+        try {
+            let baseUrl = (order.base_url || '').replace(/\/+$/, '');
+            let apiKey = order.api_key;
+            let headerName = order.header_name || 'x-api-key';
+            let authType = order.auth_type || 'header';
+
+            // Nếu order chưa join provider info
+            if (!baseUrl && order.api_provider_id) {
+                const [provs]: any = await pool.execute(`SELECT * FROM ${TABLES.API_PROVIDERS} WHERE id = ?`, [order.api_provider_id]);
+                if (provs && provs.length > 0) {
+                    baseUrl = (provs[0].base_url || '').replace(/\/+$/, '');
+                    apiKey = provs[0].api_key;
+                    headerName = provs[0].header_name || 'x-api-key';
+                    authType = provs[0].auth_type || 'header';
+                }
+            }
+
+            if (!baseUrl || !order.api_order_code) return null;
+
+            const headers: Record<string, string> = {
+                'Accept': 'application/json',
+            };
+            if (authType === 'bearer') {
+                headers['Authorization'] = `Bearer ${apiKey}`;
+            } else {
+                headers[headerName] = apiKey;
+            }
+
+            const statusUrl = `${baseUrl}/api/jobs/status/${encodeURIComponent(order.api_order_code)}`;
+            const resp = await axios.get(statusUrl, {
+                headers,
+                httpsAgent: ipv4HttpsAgent,
+                timeout: 15000
+            } as any);
+
+            if (!resp?.data) return null;
+            const data: any = resp.data;
+            const newStatus = (data.status || '').toLowerCase();
+            const progress = data.progress !== undefined ? data.progress : null;
+            const note = data.note || '';
+            const resultLink = data.result_link || '';
+
+            if (!newStatus || newStatus === (order.api_status || '').toLowerCase()) {
+                // Vẫn update api_response nếu có thay đổi progress/note
+                if (progress !== null || note) {
+                    await pool.execute(
+                        `UPDATE ${TABLES.ORDERS} SET api_response = ? WHERE id = ?`,
+                        [JSON.stringify(data), order.id]
+                    );
+                }
+                return data;
+            }
+
+            logger.info(`[JobStatusCheck] Order #${order.code} (Job ${order.api_order_code}) đổi trạng thái: ${order.api_status} -> ${newStatus}`);
+
+            // Cập nhật database
+            await pool.execute(
+                `UPDATE ${TABLES.ORDERS} SET api_status = ?, api_response = ?, updated_at = NOW() WHERE id = ?`,
+                [newStatus, JSON.stringify(data), order.id]
+            );
+
+            // Lấy thông tin khách hàng và ngôn ngữ
+            const [custRows]: any = await pool.execute(
+                `SELECT telegram_id, language, full_name, username FROM ${TABLES.CUSTOMERS} WHERE id = ? AND tenant_id = ?`,
+                [order.customer_id, order.tenant_id]
+            );
+            const customer = custRows?.[0];
+
+            // Lấy thông tin tài khoản đã giao
+            const [itemRows]: any = await pool.execute(
+                `SELECT id, content FROM ${TABLES.PRODUCT_ITEMS} WHERE order_id = ? AND tenant_id = ?`,
+                [order.id, order.tenant_id]
+            );
+
+            // Trích xuất credentials nếu có trong deposit_requests
+            let targetEmail = '';
+            let credentialsStr = '';
+            const [depRows]: any = await pool.execute(
+                `SELECT credentials FROM ${TABLES.DEPOSIT_REQUESTS} WHERE payment_code = ? AND tenant_id = ? LIMIT 1`,
+                [order.code, order.tenant_id]
+            );
+            if (depRows?.[0]?.credentials) {
+                credentialsStr = depRows[0].credentials;
+                targetEmail = credentialsStr.split('|')[0]?.trim();
+            }
+
+            const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+            const lang = customer?.language || 'vi';
+
+            if (newStatus === 'completed' || newStatus === 'success') {
+                const completedContent = [
+                    `🎉 <b>NÂNG CẤP TÀI KHOẢN THÀNH CÔNG!</b>`,
+                    targetEmail ? `📧 <b>Tài khoản:</b> <code>${targetEmail}</code>` : '',
+                    `🆔 <b>Mã tiến trình (Job ID):</b> <code>${order.api_order_code}</code>`,
+                    resultLink ? `🎁 <b>Kết quả:</b> ${resultLink}` : '',
+                    note ? `📝 <b>Ghi chú:</b> ${note}` : '',
+                    `🕒 <b>Thời gian hoàn tất:</b> ${timeVN}`
+                ].filter(Boolean).join('\n');
+
+                if (itemRows && itemRows.length > 0) {
+                    await pool.execute(
+                        `UPDATE ${TABLES.PRODUCT_ITEMS} SET content = ? WHERE id = ?`,
+                        [completedContent, itemRows[0].id]
+                    );
+                }
+
+                if (customer?.telegram_id) {
+                    const custMsg = (lang === 'en')
+                        ? [
+                            `🎉 <b>ACCOUNT UPGRADE COMPLETED!</b>`,
+                            ``,
+                            `📦 <b>Order:</b> <code>${order.code}</code>`,
+                            targetEmail ? `📧 <b>Account:</b> <code>${targetEmail}</code>` : '',
+                            `🆔 <b>Job ID:</b> <code>${order.api_order_code}</code>`,
+                            resultLink ? `🎁 <b>Gift/Activation Link:</b> ${resultLink}` : '',
+                            note ? `📝 <b>Note:</b> ${note}` : '',
+                            `🕒 <b>Completed at:</b> ${timeVN}`,
+                            ``,
+                            `✨ <i>Thank you for using our service! Your package is now active.</i>`
+                          ].filter(Boolean).join('\n')
+                        : [
+                            `🎉 <b>CHÚC MỪNG: TÀI KHOẢN ĐÃ ĐƯỢC NÂNG CẤP THÀNH CÔNG!</b>`,
+                            ``,
+                            `📦 <b>Đơn hàng:</b> <code>${order.code}</code>`,
+                            targetEmail ? `📧 <b>Tài khoản:</b> <code>${targetEmail}</code>` : '',
+                            `🆔 <b>Mã tiến trình (Job ID):</b> <code>${order.api_order_code}</code>`,
+                            resultLink ? `🎁 <b>Link kích hoạt / Quà tặng:</b> ${resultLink}` : '',
+                            note ? `📝 <b>Ghi chú:</b> ${note}` : '',
+                            `🕒 <b>Hoàn tất lúc:</b> ${timeVN}`,
+                            ``,
+                            `✨ <i>Cảm ơn bạn đã tin tưởng sử dụng dịch vụ!</i>`
+                          ].filter(Boolean).join('\n');
+
+                    await telegramService.notifyUser(order.tenant_id, customer.telegram_id, custMsg, { parse_mode: 'HTML' });
+                }
+
+                const adminMsg = [
+                    `✅ <b>[ĐƠN HÀNG API HOÀN TẤT THÀNH CÔNG]</b>`,
+                    `🕒 <b>Thời gian:</b> ${timeVN}`,
+                    `📝 <b>Mã đơn:</b> <code>${order.code}</code> (Job: <code>${order.api_order_code}</code>)`,
+                    `👤 <b>Khách hàng:</b> ${customer?.full_name || ''} | @${customer?.username || 'N/A'} (ID: <code>${customer?.telegram_id}</code>)`,
+                    targetEmail ? `📧 <b>Tài khoản:</b> <code>${targetEmail}</code>` : '',
+                    resultLink ? `🎁 <b>Kết quả:</b> ${resultLink}` : '',
+                    note ? `📝 <b>Ghi chú:</b> ${note}` : ''
+                ].filter(Boolean).join('\n');
+                telegramService.notifyAdmin(order.tenant_id, adminMsg);
+
+            } else if (newStatus === 'failed' || newStatus === 'error') {
+                const failedContent = [
+                    `⚠️ <b>KÍCH HOẠT KHÔNG THÀNH CÔNG</b>`,
+                    targetEmail ? `📧 <b>Tài khoản:</b> <code>${targetEmail}</code>` : '',
+                    `🆔 <b>Job ID:</b> <code>${order.api_order_code}</code>`,
+                    `❌ <b>Lý do:</b> ${note || 'Hệ thống Google từ chối hoặc yêu cầu bảo mật'}`,
+                    progress !== null ? `📊 <b>Tiến trình dừng ở:</b> ${progress}%` : '',
+                    `📌 <i>Vui lòng liên hệ Admin để được hỗ trợ kiểm tra hoặc đổi tài khoản.</i>`
+                ].filter(Boolean).join('\n');
+
+                if (itemRows && itemRows.length > 0) {
+                    await pool.execute(
+                        `UPDATE ${TABLES.PRODUCT_ITEMS} SET content = ? WHERE id = ?`,
+                        [failedContent, itemRows[0].id]
+                    );
+                }
+
+                if (customer?.telegram_id) {
+                    const custMsg = (lang === 'en')
+                        ? [
+                            `⚠️ <b>ORDER STATUS NOTIFICATION</b>`,
+                            ``,
+                            `📝 <b>Order:</b> <code>${order.code}</code>`,
+                            targetEmail ? `📧 <b>Account:</b> <code>${targetEmail}</code>` : '',
+                            `🆔 <b>Job ID:</b> <code>${order.api_order_code}</code>`,
+                            `❌ <b>Status:</b> Failed (${note || 'System processing error'})`,
+                            ``,
+                            `📌 <b>Common reasons:</b>`,
+                            `• Google prompt/2FA verification required on your phone.`,
+                            `• Account already used this promotional offer or is in a Family Group.`,
+                            `• Incorrect password or 2FA credentials.`,
+                            ``,
+                            `👉 <i>Please contact Admin to re-process or replace with another account!</i>`
+                          ].filter(Boolean).join('\n')
+                        : [
+                            `⚠️ <b>THÔNG BÁO TIẾN TRÌNH ĐƠN HÀNG</b>`,
+                            ``,
+                            `📝 <b>Mã đơn:</b> <code>${order.code}</code>`,
+                            targetEmail ? `📧 <b>Tài khoản:</b> <code>${targetEmail}</code>` : '',
+                            `🆔 <b>Mã tiến trình (Job ID):</b> <code>${order.api_order_code}</code>`,
+                            `❌ <b>Trạng thái:</b> Kích hoạt không thành công (${note || 'Lỗi xử lý từ Google'})`,
+                            ``,
+                            `📌 <b>Lý do thường gặp:</b>`,
+                            `• Google phát hiện đăng nhập lạ và yêu cầu bấm xác nhận trên điện thoại của bạn.`,
+                            `• Tài khoản không đủ điều kiện (đã từng nhận gói ưu đãi này hoặc đang trong Family Group khác).`,
+                            `• Mật khẩu hoặc mã 2FA bị thay đổi/không đúng.`,
+                            ``,
+                            `👉 <i>Vui lòng nhắn tin trực tiếp cho Admin để được hỗ trợ kiểm tra, xử lý lại hoặc đổi tài khoản khác nhé!</i>`
+                          ].filter(Boolean).join('\n');
+
+                    await telegramService.notifyUser(order.tenant_id, customer.telegram_id, custMsg, { parse_mode: 'HTML' });
+                }
+
+                const adminMsg = [
+                    `🚨 <b>[CẢNH BÁO ĐƠN HÀNG API THẤT BẠI]</b>`,
+                    `🕒 <b>Thời gian:</b> ${timeVN}`,
+                    `📝 <b>Mã đơn:</b> <code>${order.code}</code>`,
+                    `🆔 <b>Job ID:</b> <code>${order.api_order_code}</code>`,
+                    `👤 <b>Khách hàng:</b> ${customer?.full_name || ''} | @${customer?.username || 'N/A'} (ID: <code>${customer?.telegram_id}</code>)`,
+                    credentialsStr ? `📧 <b>Tài khoản:</b> <code>${credentialsStr}</code>` : (targetEmail ? `📧 <b>Tài khoản:</b> <code>${targetEmail}</code>` : ''),
+                    `❌ <b>Lỗi từ nhà cung cấp:</b> ${note || 'Failed'} ${progress !== null ? `(dừng ở ${progress}%)` : ''}`,
+                    `💰 <b>Lưu ý:</b> Số dư kho sỉ Safe24 KHÔNG bị trừ tiền cho đơn lỗi này.`,
+                    `📌 <i>Vui lòng vào CMS kiểm tra hoặc hỗ trợ khách!</i>`
+                ].filter(Boolean).join('\n');
+                telegramService.notifyAdmin(order.tenant_id, adminMsg);
+            }
+
+            return data;
+        } catch (err: any) {
+            logger.warn(`[JobStatusCheck] Không thể check job ${order.api_order_code}: ${err.message}`);
+            return null;
         }
     }
 }

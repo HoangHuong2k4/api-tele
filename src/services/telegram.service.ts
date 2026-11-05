@@ -267,6 +267,7 @@ class TelegramService {
             if (data === 'history') return this.handleHistoryAction(ctx, 1);
             if (data.startsWith('history_page:')) return this.handleHistoryAction(ctx, parseInt(data.split(':')[1]) || 1);
             if (data.startsWith('history_order:')) return this.sendHistoryOrderDetail(ctx, parseInt(data.split(':')[1]));
+            if (data.startsWith('check_job_')) return this.handleCheckJobStatus(ctx, parseInt(data.split('_')[2]));
             if (data === 'deposit') return this.handleDepositAction(ctx);
             if (data === 'menu' || data === 'menu_keep') return this.handleMenuAction(ctx, tgId, data === 'menu_keep');
             if (data === 'cancel') return this.handleCancelAction(ctx, tgId);
@@ -398,6 +399,51 @@ class TelegramService {
 
         if (!email || !password || !email.includes('@')) {
             return ctx.reply(i18n.t(lang, 'invalid_email_or_pass'), { parse_mode: 'HTML' });
+        }
+
+        // Kiểm tra xem sản phẩm có yêu cầu mã bảo mật 2FA TOTP không (Safe24 / account_upgrade)
+        try {
+            const [prodRows]: any = await pool.execute(
+                `SELECT p.id, p.name, p.api_provider_id, p.api_delivery_mode, ap.base_url 
+                 FROM ${TABLES.PRODUCTS} p 
+                 LEFT JOIN ${TABLES.API_PROVIDERS} ap ON p.api_provider_id = ap.id 
+                 WHERE p.id = ? AND p.tenant_id = ? LIMIT 1`,
+                [productId, ctx.tenantId]
+            );
+
+            if (prodRows && prodRows.length > 0) {
+                const prod = prodRows[0];
+                const isSafe24OrUpgrade = prod.api_delivery_mode === 'account_upgrade' || prod.base_url?.includes('apisafe24') || prod.base_url?.includes('jobs/create');
+                if (isSafe24OrUpgrade) {
+                    const rawTotp = parts[2] ? parts[2].replace(/\s+/g, '') : '';
+                    if (!rawTotp || rawTotp.length < 8) {
+                        const missing2faMsg = lang === 'en'
+                            ? `⚠️ <b>Missing 2FA TOTP Secret Key!</b>\n\n` +
+                              `This service requires <b>2-Step Verification (2FA)</b> enabled on your Google account.\n\n` +
+                              `<b>Required format:</b>\n` +
+                              `<code>Email | Password | 2FA_Secret_Key</code>\n\n` +
+                              `<i>Example:</i>\n` +
+                              `<code>${email} | ${password} | JBSWY3DPEHPK3PXP</code>\n\n` +
+                              `📌 <b>How to get 2FA Secret Key on Google:</b>\n` +
+                              `1. Go to <b>Google Account</b> > <b>Security</b> > <b>2-Step Verification</b>\n` +
+                              `2. Choose <b>Authenticator app</b> > Click <b>"Can't scan QR?"</b>\n` +
+                              `3. Copy the 32-character Secret Key and send it here!`
+                            : `⚠️ <b>Thiếu mã bảo mật 2FA (TOTP Secret Key)!</b>\n\n` +
+                              `Dịch vụ này <b>bắt buộc</b> tài khoản Google phải bật xác minh 2 bước qua ứng dụng Authenticator để hệ thống tự động kích hoạt.\n\n` +
+                              `<b>Định dạng bắt buộc:</b>\n` +
+                              `<code>Email | Mật khẩu | Mã_Khóa_Bí_Mật_2FA</code>\n\n` +
+                              `<i>Ví dụ:</i>\n` +
+                              `<code>${email} | ${password} | JBSWY3DPEHPK3PXP</code>\n\n` +
+                              `📌 <b>Cách lấy mã bí mật 2FA trên Google:</b>\n` +
+                              `1. Vào <b>Tài khoản Google</b> > <b>Bảo mật</b> > <b>Xác minh 2 bước</b>\n` +
+                              `2. Chọn <b>Ứng dụng Authenticator</b> > Bấm <b>"Không thể quét mã?"</b>\n` +
+                              `3. Sao chép chuỗi khóa bí mật (Secret Key) và gửi lại vào đây!`;
+                        return ctx.reply(missing2faMsg, { parse_mode: 'HTML' });
+                    }
+                }
+            }
+        } catch (checkErr) {
+            logger.warn(`[handleAccountCredentialsInput] Check product 2FA error: ${checkErr}`);
         }
 
         const userIdKey = user ? user.id.toString() : tgId;
@@ -966,7 +1012,8 @@ class TelegramService {
         const comboId = parts[3] ? parseInt(parts[3]) : undefined;
 
         const user = await this.getUser(ctx.tenantId, tgId);
-        const [prod] = await pool.execute(`SELECT name, price as retail_price FROM ${TABLES.PRODUCTS} WHERE id = ? AND tenant_id = ?`, [productId, ctx.tenantId]) as any;
+        const lang = user?.language || 'vi';
+        const [prod] = await pool.execute(`SELECT name, price as retail_price, api_delivery_mode FROM ${TABLES.PRODUCTS} WHERE id = ? AND tenant_id = ?`, [productId, ctx.tenantId]) as any;
 
         if (!user || !prod.length) return this.safeAnswerCb(ctx, 'Lỗi đồng bộ.', { show_alert: true });
 
@@ -1012,6 +1059,23 @@ class TelegramService {
 
         const userCredKey = `${user.id}_${productId}`;
         const credentials = this.userCredentials.get(userCredKey) || this.userCredentials.get(`${tgId}_${productId}`);
+
+        // Nếu sản phẩm nâng cấp tài khoản nhưng chưa có credentials hoặc thiếu mã 2FA
+        if (prod[0].api_delivery_mode === 'account_upgrade') {
+            const credParts = (credentials || '').split('|').map((s: string) => s.trim());
+            const totp = credParts[2] ? credParts[2].replace(/\s+/g, '') : '';
+            if (!credentials || credParts.length < 3 || !totp || totp.length < 8) {
+                this.userStates.set(tgId, { step: 'AWAITING_ACCOUNT_CREDENTIALS', productId, quantity });
+                const promptMsg = i18n.t(lang, 'account_upgrade_prompt');
+                const kb = { inline_keyboard: [[{ text: i18n.t(lang, 'btn_back'), callback_data: 'menu' }]] };
+                if (ctx.callbackQuery) {
+                    await ctx.answerCbQuery?.('Vui lòng gửi thông tin tài khoản kèm 2FA');
+                    return await ctx.editMessageText(promptMsg, { parse_mode: 'HTML', reply_markup: kb });
+                } else {
+                    return await ctx.reply(promptMsg, { parse_mode: 'HTML', reply_markup: kb });
+                }
+            }
+        }
 
         this.safeAnswerCb(ctx, '🚀 Đang xử lý thanh toán...');
         const result = await this.handleDirectPurchase(ctx.tenantId, user.id, productId, quantity, undefined, bonusQty, selectedComboId, `tg_${tgId}`, credentials);
@@ -1934,7 +1998,7 @@ class TelegramService {
             if (!user) return ctx.reply('❌ Bạn chưa có tài khoản.');
 
             const [orderRows] = await pool.execute(
-                `SELECT o.total_amount, o.code, o.created_at,
+                `SELECT o.id, o.total_amount, o.code, o.created_at, o.api_order_code, o.api_status,
                         p.name as product_name, od.quantity, od.price
                  FROM telehub_orders o
                  LEFT JOIN telehub_order_details od ON od.order_id = o.id
@@ -1957,13 +2021,13 @@ class TelegramService {
                 if (i.content && !i.username) {
                     return i.content.split('\n').map((line: string) => {
                         const trimmed = line.trim();
-                        return trimmed.startsWith('http') ? trimmed : `<code>${trimmed}</code>`;
+                        return trimmed.startsWith('http') || trimmed.includes('<') || trimmed.includes('>') ? trimmed : `<code>${trimmed}</code>`;
                     }).join('\n');
                 }
                 const accInfo = [i.username, i.password, i.note].filter(Boolean).join('\n');
                 return accInfo.split('\n').map((line: string) => {
                     const trimmed = line.trim();
-                    return trimmed.startsWith('http') ? trimmed : `<code>${trimmed}</code>`;
+                    return trimmed.startsWith('http') || trimmed.includes('<') || trimmed.includes('>') ? trimmed : `<code>${trimmed}</code>`;
                 }).join('\n');
             });
 
@@ -1979,16 +2043,50 @@ class TelegramService {
             msg += `💳 <b>Tổng:</b> ${this.fmt(order.total_amount)}đ\n`;
             msg += `\n━━━━━━━━━━━━━━━━━━\n📑 <b>Tài khoản bàn giao:</b>\n\n`;
 
+            const keyboardRows: any[][] = [];
+            if (order.api_order_code) {
+                keyboardRows.push([{ text: '🔄 Cập nhật tiến trình Job', callback_data: `check_job_${orderId}` }]);
+            }
+            keyboardRows.push([{ text: i18n.t(lang, 'btn_back'), callback_data: 'history' }]);
+
             if (formattedItems.length > 5) {
                 msg += `<i>Do danh sách quá dài, hệ thống đã gửi kèm file txt cho bạn ở bên dưới.</i>`;
-                await ctx.reply(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: i18n.t(lang, 'btn_back'), callback_data: 'history' }]] } });
+                await ctx.reply(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
                 await this.deliveryAsFile(ctx, orderId, items.map((i: any) => (i.content || [i.username, i.password, i.note].filter(Boolean).join('\n'))));
             } else {
                 msg += formattedItems.join('\n\n');
-                await ctx.reply(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: i18n.t(lang, 'btn_back'), callback_data: 'history' }]] } });
+                await ctx.reply(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
             }
         } catch (err: any) {
             logger.error(`[Tenant ${ctx.tenantId}] sendHistoryOrderDetail error: ${err.message}`);
+        }
+    }
+
+    private async handleCheckJobStatus(ctx: any, orderId: number) {
+        try {
+            await ctx.answerCbQuery?.('⏳ Đang kiểm tra tiến trình...');
+            const [orderRows]: any = await pool.execute(
+                `SELECT o.*, p.base_url, p.auth_type, p.header_name, p.api_key
+                 FROM ${TABLES.ORDERS} o
+                 JOIN ${TABLES.API_PROVIDERS} p ON p.id = o.api_provider_id
+                 WHERE o.id = ? AND o.tenant_id = ?`,
+                [orderId, ctx.tenantId]
+            );
+            if (!orderRows || orderRows.length === 0) {
+                return ctx.reply('❌ Không tìm thấy thông tin đơn hàng API.');
+            }
+            const order = orderRows[0];
+            const { apiProviderService } = await import('./api-provider.service');
+            const result = await apiProviderService.checkSingleJobStatus(order);
+            if (result) {
+                const status = (result.status || 'unknown').toUpperCase();
+                const progress = result.progress !== undefined ? ` (${result.progress}%)` : '';
+                const note = result.note ? `\n📝 ${result.note}` : '';
+                await ctx.reply(`📊 <b>Tiến trình Job [<code>${order.api_order_code}</code>]:</b>\nTrạng thái: <code>${status}</code>${progress}${note}`, { parse_mode: 'HTML' });
+            }
+            return this.sendHistoryOrderDetail(ctx, orderId);
+        } catch (err: any) {
+            return ctx.reply(`❌ Lỗi kiểm tra: ${err.message}`);
         }
     }
 
@@ -2118,9 +2216,13 @@ class TelegramService {
                         const parts = credentials.split('|').map((s: string) => s.trim());
                         reqBody.email = parts[0] || '';
                         reqBody.password = parts[1] || '';
-                        reqBody.totp_secret = parts[2] || '';
+                        const totp = (parts[2] || '').replace(/\s+/g, '');
+                        if (!totp) {
+                            throw new Error('Tài khoản thiếu mã bảo mật 2FA (Secret Key). Bắt buộc phải có 2FA để kích hoạt gói.');
+                        }
+                        reqBody.totp_secret = totp;
                     } else {
-                        throw new Error('Thiếu thông tin tài khoản (Email | Mật khẩu) để thực hiện nâng cấp.');
+                        throw new Error('Thiếu thông tin tài khoản (Email | Mật khẩu | Mã 2FA) để thực hiện nâng cấp.');
                     }
                 }
 
@@ -2176,8 +2278,10 @@ class TelegramService {
                     } else if (isLowBalance) {
                         this.notifyAdmin(tenantId, `⚠️ **THÔNG BÁO CẠN SỐ DƯ API KHO SỈ**\n\n- Khách: \`${userId}\` đang mua \`${product.name}\` (SL: ${totalAccNeeded})\n- Nhà cung cấp: \`${provider.name || provider.id}\`\n- Lỗi: ${errDetail}\n- Vui lòng nạp thêm tiền vào kho sỉ để đơn hàng API tiếp theo không bị lỗi.`);
                         throw new Error(`Hệ thống đang bận hoặc gián đoạn kết nối, vui lòng thử lại sau ít phút.`);
+                    } else if (String(errDetail).toLowerCase().includes('totp') || String(errDetail).toLowerCase().includes('2fa')) {
+                        throw new Error(`Tài khoản chưa có mã 2FA TOTP hợp lệ: ${errDetail}`);
                     } else {
-                        throw new Error(`Hệ thống đang bận hoặc gián đoạn kết nối, vui lòng thử lại sau ít phút.`);
+                        throw new Error(errDetail ? `Lỗi nhà cung cấp API: ${errDetail}` : `Hệ thống đang bận hoặc gián đoạn kết nối, vui lòng thử lại sau ít phút.`);
                     }
                 }
 
@@ -2194,7 +2298,10 @@ class TelegramService {
                     if (String(errorMsg).toLowerCase().includes('khong du hang') || String(errorMsg).toLowerCase().includes('hết hàng')) {
                         throw new Error(`Sản phẩm hiện đang tạm hết hàng, vui lòng thử lại sau.`);
                     }
-                    throw new Error('Hệ thống đang bận hoặc gián đoạn kết nối, vui lòng thử lại sau ít phút.');
+                    if (String(errorMsg).toLowerCase().includes('totp') || String(errorMsg).toLowerCase().includes('2fa')) {
+                        throw new Error(`Tài khoản thiếu hoặc sai mã 2FA TOTP: ${errorMsg}`);
+                    }
+                    throw new Error(`Lỗi nhà cung cấp: ${errorMsg}`);
                 }
 
                 const respData = apiResp.data.data || apiResp.data.order || apiResp.data;
