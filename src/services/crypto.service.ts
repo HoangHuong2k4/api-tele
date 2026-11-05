@@ -12,6 +12,7 @@ class CryptoService {
     private lastOffsetFetch = 0;
     private readonly OFFSET_TTL = 5 * 60 * 1000; // 5 phút
     private unmatchedNotified = new Set<string>();
+    private processedTxCache = new Set<string>();
     private consecutiveErrors: Map<number, number> = new Map();
     private lastErrorAlertTime: Map<number, number> = new Map();
 
@@ -170,15 +171,9 @@ class CryptoService {
 
             const requestList = [...(requests || [])];
             for (const item of unifiedIncoming) {
+                if (this.processedTxCache.has(item.txId)) continue;
+
                 const usdtAmt = item.amount;
-
-                // Kiểm tra txId đã được xử lý chưa (tránh duplicate trên mọi tenant dùng chung ví)
-                const [dup]: any = await pool.execute(
-                    `SELECT id FROM telehub_balance_logs WHERE note LIKE ?`,
-                    [`%${item.txId}%`]
-                );
-                if (dup?.length) continue;
-
                 const depTime = item.time;
 
                 // Lọc các request nằm trong khung thời gian hợp lệ:
@@ -188,6 +183,22 @@ class CryptoService {
                     if (isNaN(reqTime)) return false;
                     return depTime >= reqTime - 2 * 60 * 1000 && depTime <= reqTime + 35 * 60 * 1000;
                 });
+
+                const isRecent = (Date.now() - depTime) <= 30 * 60 * 1000;
+                if (!validTimeRequests.length && !isRecent) {
+                    continue;
+                }
+
+                // Kiểm tra txId đã được xử lý chưa (chỉ truy vấn DB khi giao dịch nằm trong khung giờ hợp lệ)
+                const [dup]: any = await pool.execute(
+                    `SELECT id FROM telehub_balance_logs WHERE tenant_id = ? AND note LIKE ? LIMIT 1`,
+                    [tenantId, `%${item.txId}%`]
+                );
+                if (dup?.length) {
+                    if (this.processedTxCache.size > 5000) this.processedTxCache.clear();
+                    this.processedTxCache.add(item.txId);
+                    continue;
+                }
 
                 let matchedReq: any = null;
 

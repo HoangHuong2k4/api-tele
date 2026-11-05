@@ -40,6 +40,8 @@ class TelegramService {
     private bots: Map<number, { selling: Telegraf, notifying: Telegraf, adminId: string, token: string }> = new Map();
     private userStates: Map<string, UserState> = new Map();
     private userCredentials: Map<string, string> = new Map();
+    private configCache: Map<number, { data: any, expiresAt: number }> = new Map();
+    private registeredUsersCache: Map<string, { sig: string, expiresAt: number }> = new Map();
 
     // Consolidated UI Elements
     private readonly UI = {
@@ -64,6 +66,7 @@ class TelegramService {
     public async initAllBots() {
         try {
             logger.info(`🔄 Đang tải cấu hình Bot từ Database [${process.env.DB_NAME}]...`);
+            this.configCache.clear();
             const [configs]: any = await pool.execute(`SELECT * FROM ${TABLES.BOT_CONFIGS} WHERE status = "published"`);
 
             const activeTenantIds = new Set<number>();
@@ -122,13 +125,37 @@ class TelegramService {
             ? new Telegraf(config.telegram_notification_id, options)
             : sellingBot;
 
-        // Inject tenant + hot-reload config per request
+        // Inject tenant + cached config per request (15s TTL) & safe editMessageText wrapper
         sellingBot.use(async (ctx: any, next) => {
             ctx.tenantId = tenantId;
-            try {
-                const [rows]: any = await pool.execute(`SELECT * FROM ${TABLES.BOT_CONFIGS} WHERE tenant_id = ?`, [tenantId]);
-                ctx.config = rows[0] || config;
-            } catch { ctx.config = config; }
+            if (ctx.editMessageText) {
+                const origEdit = ctx.editMessageText.bind(ctx);
+                ctx.editMessageText = async (text: string, extra?: any) => {
+                    try {
+                        return await origEdit(text, extra);
+                    } catch (err: any) {
+                        const desc = err?.response?.description || err?.message || '';
+                        if (desc.includes('message is not modified')) {
+                            return;
+                        }
+                        throw err;
+                    }
+                };
+            }
+            const now = Date.now();
+            const cached = this.configCache.get(tenantId);
+            if (cached && cached.expiresAt > now) {
+                ctx.config = cached.data;
+            } else {
+                try {
+                    const [rows]: any = await pool.execute(`SELECT * FROM ${TABLES.BOT_CONFIGS} WHERE tenant_id = ?`, [tenantId]);
+                    const cfg = rows[0] || config;
+                    this.configCache.set(tenantId, { data: cfg, expiresAt: now + 15000 });
+                    ctx.config = cfg;
+                } catch {
+                    ctx.config = config;
+                }
+            }
             return next();
         });
 
@@ -171,21 +198,32 @@ class TelegramService {
             return next();
         });
 
-        // Auto-register user on first contact
+        // Auto-register user on first contact (with 10-minute in-memory cache so subsequent clicks don't block on DB write)
         bot.use(async (ctx: any, next) => {
             if (ctx.from?.id) {
                 const fullName = ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '');
                 const username = ctx.from.username || 'unknown';
                 const telegramId = ctx.from.id.toString();
-                try {
-                    await pool.execute(
-                        `INSERT INTO ${TABLES.CUSTOMERS} (tenant_id, telegram_id, full_name, username, balance, status, created_at, updated_at)
+                const cacheKey = `${ctx.tenantId}_${telegramId}`;
+                const sig = `${fullName}|${username}`;
+                const now = Date.now();
+                const cachedUser = this.registeredUsersCache.get(cacheKey);
+
+                const upsertSql = `INSERT INTO ${TABLES.CUSTOMERS} (tenant_id, telegram_id, full_name, username, balance, status, created_at, updated_at)
                          VALUES (?, ?, ?, ?, 0, 'published', NOW(), NOW())
-                         ON DUPLICATE KEY UPDATE full_name = VALUES(full_name), username = VALUES(username), status = 'published', updated_at = NOW()`,
-                        [ctx.tenantId, telegramId, fullName, username]
-                    );
-                } catch (err: any) {
-                    logger.error(`[Tenant #${ctx.tenantId}] auto-reg error: ${err.message}`);
+                         ON DUPLICATE KEY UPDATE full_name = VALUES(full_name), username = VALUES(username), status = 'published', updated_at = NOW()`;
+
+                if (!cachedUser || cachedUser.sig !== sig) {
+                    try {
+                        await pool.execute(upsertSql, [ctx.tenantId, telegramId, fullName, username]);
+                        if (this.registeredUsersCache.size > 10000) this.registeredUsersCache.clear();
+                        this.registeredUsersCache.set(cacheKey, { sig, expiresAt: now + 10 * 60 * 1000 });
+                    } catch (err: any) {
+                        logger.error(`[Tenant #${ctx.tenantId}] auto-reg error: ${err.message}`);
+                    }
+                } else if (cachedUser.expiresAt < now) {
+                    cachedUser.expiresAt = now + 10 * 60 * 1000;
+                    pool.execute(upsertSql, [ctx.tenantId, telegramId, fullName, username]).catch(() => {});
                 }
 
                 // Activity tracking (hourly bucket) — fire-and-forget so it never slows the bot down
@@ -459,26 +497,34 @@ class TelegramService {
     // --- Action Handlers: Wallet & Profile ---
     private async handleBalanceAction(ctx: any, tgId: string, keepMsg: boolean = false) {
         try {
+            if (ctx.callbackQuery) ctx.answerCbQuery().catch(() => {});
             const user = await this.getUser(ctx.tenantId, tgId);
-            if (!user) return ctx.answerCbQuery?.('Tài khoản chưa liên kết.', { show_alert: true });
+            if (!user) return;
 
-            const [dep] = await pool.execute(`SELECT SUM(amount) as total FROM ${TABLES.BALANCE_LOGS} WHERE customer_id = ? AND type = "deposit" AND tenant_id = ?`, [user.id, ctx.tenantId]) as any;
-            const [spent] = await pool.execute(`SELECT SUM(amount) as total FROM ${TABLES.BALANCE_LOGS} WHERE customer_id = ? AND type = "purchase" AND tenant_id = ?`, [user.id, ctx.tenantId]) as any;
+            const [totals]: any = await pool.execute(
+                `SELECT 
+                    SUM(CASE WHEN type IN ('deposit', 'IN') THEN amount ELSE 0 END) as dep_total,
+                    SUM(CASE WHEN type IN ('purchase', 'OUT') THEN amount ELSE 0 END) as spent_total
+                 FROM ${TABLES.BALANCE_LOGS}
+                 WHERE customer_id = ? AND tenant_id = ?`,
+                [user.id, ctx.tenantId]
+            );
 
-            const [configRows]: any = await pool.execute(`SELECT usdt_exchange_rate FROM ${TABLES.BOT_CONFIGS} WHERE tenant_id = ?`, [ctx.tenantId]);
-            const usdtRate = configRows[0]?.usdt_exchange_rate || 26000;
+            const usdtRate = parseFloat(ctx.config?.usdt_exchange_rate) || 26000;
+            const depTotal = totals[0]?.dep_total || 0;
+            const spentTotal = totals[0]?.spent_total || 0;
 
             const balUsd = (user.balance / usdtRate).toFixed(2);
-            const depUsd = ((dep[0].total || 0) / usdtRate).toFixed(2);
-            const spentUsd = ((spent[0].total || 0) / usdtRate).toFixed(2);
+            const depUsd = (depTotal / usdtRate).toFixed(2);
+            const spentUsd = (spentTotal / usdtRate).toFixed(2);
 
             const lang = user?.language || 'vi';
             const msg = [
                 i18n.t(lang, 'wallet_title'),
                 '',
                 i18n.t(lang, 'balance', { amount: this.fmt(user.balance) + ` ($${balUsd})` }),
-                i18n.t(lang, 'total_deposit', { amount: this.fmt(dep[0].total || 0) + ` ($${depUsd})` }),
-                i18n.t(lang, 'total_spent', { amount: this.fmt(spent[0].total || 0) + ` ($${spentUsd})` }),
+                i18n.t(lang, 'total_deposit', { amount: this.fmt(depTotal) + ` ($${depUsd})` }),
+                i18n.t(lang, 'total_spent', { amount: this.fmt(spentTotal) + ` ($${spentUsd})` }),
                 '',
                 i18n.t(lang, 'tele_id', { id: tgId }),
                 '',
@@ -494,10 +540,8 @@ class TelegramService {
             };
 
             if (ctx.callbackQuery && !keepMsg) {
-                await ctx.answerCbQuery();
                 return await ctx.editMessageText(msg, { parse_mode: 'HTML', reply_markup: keyboard });
             } else {
-                if (ctx.callbackQuery) await ctx.answerCbQuery();
                 return await ctx.reply(msg, { parse_mode: 'HTML', reply_markup: keyboard });
             }
         } catch (err: any) {
@@ -651,17 +695,20 @@ class TelegramService {
         try {
             const productId = data.split('_')[1];
 
-            const user = await this.getUser(ctx.tenantId, tgId);
-            const [prodRows] = await pool.execute(`
-                SELECT p.name, p.name_en, p.icon, p.description, p.description_en, p.price as retail_price, p.price_usd,
-                       p.is_api_product, p.api_stock, p.api_sold, p.api_delivery_mode, p.is_unlimited,
-                       CASE WHEN p.is_unlimited = 1 THEN 999999 WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 0 THEN pi.id END) END as stock,
-                       CASE WHEN p.is_api_product = 1 THEN COALESCE(p.api_sold, 0) ELSE GREATEST(COALESCE(p.api_sold, 0), COUNT(DISTINCT CASE WHEN pi.is_sold = 1 THEN pi.id END)) END as sold
-                FROM ${TABLES.PRODUCTS} p
-                LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id AND pi.tenant_id = p.tenant_id
-                WHERE p.id = ? AND p.tenant_id = ?
-                GROUP BY p.id
-            `, [productId, ctx.tenantId]) as any;
+            const [user, [prodRows], combos]: any = await Promise.all([
+                this.getUser(ctx.tenantId, tgId),
+                pool.execute(`
+                    SELECT p.name, p.name_en, p.icon, p.description, p.description_en, p.price as retail_price, p.price_usd,
+                           p.is_api_product, p.api_stock, p.api_sold, p.api_delivery_mode, p.is_unlimited,
+                           CASE WHEN p.is_unlimited = 1 THEN 999999 WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 0 THEN pi.id END) END as stock,
+                           CASE WHEN p.is_api_product = 1 THEN COALESCE(p.api_sold, 0) ELSE GREATEST(COALESCE(p.api_sold, 0), COUNT(DISTINCT CASE WHEN pi.is_sold = 1 THEN pi.id END)) END as sold
+                    FROM ${TABLES.PRODUCTS} p
+                    LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id AND pi.tenant_id = p.tenant_id
+                    WHERE p.id = ? AND p.tenant_id = ?
+                    GROUP BY p.id
+                `, [productId, ctx.tenantId]),
+                this.getActiveCombos(ctx.tenantId, productId)
+            ]);
 
             if (!prodRows || !prodRows.length) {
                 if (ctx.callbackQuery) {
@@ -670,11 +717,11 @@ class TelegramService {
                 return ctx.reply('❌ Sản phẩm không tồn tại hoặc đã bị xóa.');
             }
 
+            if (ctx.callbackQuery) ctx.answerCbQuery().catch(() => {});
             const product = prodRows[0];
 
             // Lấy giá hiệu dụng (CTV hoặc retail)
-            const [configRows]: any = await pool.execute(`SELECT usdt_exchange_rate FROM ${TABLES.BOT_CONFIGS} WHERE tenant_id = ?`, [ctx.tenantId]);
-            const usdtRate = configRows[0]?.usdt_exchange_rate || 26000;
+            const usdtRate = parseFloat(ctx.config?.usdt_exchange_rate) || 26000;
 
             let activePrice = product.retail_price;
             let activePriceUsd = product.price_usd;
@@ -731,7 +778,6 @@ class TelegramService {
             }
 
             // === COMBO SECTION ===
-            const combos = await this.getActiveCombos(ctx.tenantId, productId);
             let comboHtml = '';
             const comboButtons: any[] = [];
 
@@ -853,23 +899,24 @@ class TelegramService {
         const [, productId, qtyStr] = data.split('_');
         const quantity = parseInt(qtyStr);
 
-        const user = await this.getUser(ctx.tenantId, tgId);
+        const [user, [prodRows], combos]: any = await Promise.all([
+            this.getUser(ctx.tenantId, tgId),
+            pool.execute(`
+                SELECT p.name, p.name_en, p.icon, p.price as retail_price, p.price_usd,
+                       p.is_api_product, p.api_stock, p.api_delivery_mode, p.is_unlimited,
+                       CASE WHEN p.is_unlimited = 1 THEN 999999 WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(pi.id) END as stock 
+                FROM ${TABLES.PRODUCTS} p 
+                LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id 
+                    AND pi.is_sold = 0
+                    AND (pi.reserved_until IS NULL OR pi.reserved_until < NOW())
+                WHERE p.id = ? AND p.tenant_id = ?
+                GROUP BY p.id
+            `, [productId, ctx.tenantId]),
+            this.getActiveCombos(ctx.tenantId, productId)
+        ]);
+
         const lang = user?.language || 'vi';
-
-        const [prodRows] = await pool.execute(`
-            SELECT p.name, p.name_en, p.icon, p.price as retail_price, p.price_usd,
-                   p.is_api_product, p.api_stock, p.api_delivery_mode, p.is_unlimited,
-                   CASE WHEN p.is_unlimited = 1 THEN 999999 WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(pi.id) END as stock 
-            FROM ${TABLES.PRODUCTS} p 
-            LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id 
-                AND pi.is_sold = 0
-                AND (pi.reserved_until IS NULL OR pi.reserved_until < NOW())
-            WHERE p.id = ? AND p.tenant_id = ?
-            GROUP BY p.id
-        `, [productId, ctx.tenantId]) as any;
-
-        const [configRows]: any = await pool.execute(`SELECT usdt_exchange_rate FROM ${TABLES.BOT_CONFIGS} WHERE tenant_id = ?`, [ctx.tenantId]);
-        const usdtRate = configRows[0]?.usdt_exchange_rate || 26000;
+        const usdtRate = parseFloat(ctx.config?.usdt_exchange_rate) || 26000;
 
         if (!prodRows.length) return this.safeAnswerCb(ctx, 'Sản phẩm đã bị xóa.', { show_alert: true });
 
@@ -909,7 +956,6 @@ class TelegramService {
         }
 
         // === ÁP DỤNG COMBO ===
-        const combos = await this.getActiveCombos(ctx.tenantId, productId);
         const bestCombo = this.getBestCombo(combos, quantity, activePrice);
         const comboResult = this.applyCombo(bestCombo, quantity, activePrice, lang);
         const { total, actualQty, bonusQty, discountText } = comboResult;
@@ -920,9 +966,9 @@ class TelegramService {
             return this.safeAnswerCb(ctx, errorMsg, { show_alert: true });
         }
 
-        // === TẠM GIỮ SLOT cho thanh toán Ví (5 phút) ===
+        // === TẠM GIỮ SLOT cho thanh toán Ví (5 phút, chạy ngầm không chặn UI) ===
         if (user && !product.is_unlimited && !product.is_api_product) {
-            await this.reserveStock(ctx.tenantId, parseInt(productId), actualQty, `tg_${tgId}`, 5);
+            this.reserveStock(ctx.tenantId, parseInt(productId), actualQty, `tg_${tgId}`, 5).catch(() => {});
         }
 
         const buttons = [];
@@ -1743,23 +1789,23 @@ class TelegramService {
     // --- View Generators ---
     public async sendMenu(ctx: any, keepMsg: boolean = false) {
         const tgId = ctx.from.id.toString();
-        const user = await this.getUser(ctx.tenantId, tgId);
+
+        const [user, [rows]]: any = await Promise.all([
+            this.getUser(ctx.tenantId, tgId),
+            pool.execute(`
+                SELECT p.id, p.name, p.name_en, p.icon, p.price as retail_price, p.price_usd,
+                       p.is_api_product, p.api_stock, p.is_unlimited,
+                       CASE WHEN p.is_unlimited = 1 THEN 999999 WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(pi.id) END as stock
+                FROM ${TABLES.PRODUCTS} p
+                LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id AND pi.is_sold = 0 AND pi.tenant_id = p.tenant_id
+                WHERE p.status = 'published' AND p.tenant_id = ?
+                GROUP BY p.id
+                ORDER BY p.name ASC
+            `, [ctx.tenantId])
+        ]);
 
         const lang = user?.language || 'vi';
-
-        const [rows] = await pool.execute(`
-            SELECT p.id, p.name, p.name_en, p.icon, p.price as retail_price, p.price_usd,
-                   p.is_api_product, p.api_stock, p.is_unlimited,
-                   CASE WHEN p.is_unlimited = 1 THEN 999999 WHEN p.is_api_product = 1 THEN p.api_stock ELSE COUNT(DISTINCT CASE WHEN pi.is_sold = 0 THEN pi.id END) END as stock
-            FROM ${TABLES.PRODUCTS} p
-            LEFT JOIN ${TABLES.PRODUCT_ITEMS} pi ON p.id = pi.product_id AND pi.tenant_id = p.tenant_id
-            WHERE p.status = 'published' AND p.tenant_id = ?
-            GROUP BY p.id
-            ORDER BY p.name ASC
-        `, [ctx.tenantId]) as any;
-
-        const [configRows]: any = await pool.execute(`SELECT usdt_exchange_rate FROM ${TABLES.BOT_CONFIGS} WHERE tenant_id = ?`, [ctx.tenantId]);
-        const usdtRate = configRows[0]?.usdt_exchange_rate || 26000;
+        const usdtRate = parseFloat(ctx.config?.usdt_exchange_rate) || 26000;
 
         let priceMap = new Map();
         if (user && user.is_dealer) {
@@ -1920,7 +1966,14 @@ class TelegramService {
 
             if (page > totalPages) page = totalPages;
 
-            const [history] = await pool.execute(`SELECT order_id, type, amount, note as description, created_at FROM ${TABLES.BALANCE_LOGS} WHERE customer_id = ? AND tenant_id = ? ORDER BY id DESC LIMIT ? OFFSET ?`, [user.id, ctx.tenantId, limit, offset]) as any;
+            const [history] = await pool.execute(
+                `SELECT bl.order_id, bl.type, bl.amount, bl.note as description, bl.created_at, o.code as order_code
+                 FROM ${TABLES.BALANCE_LOGS} bl
+                 LEFT JOIN telehub_orders o ON o.id = bl.order_id
+                 WHERE bl.customer_id = ? AND bl.tenant_id = ?
+                 ORDER BY bl.id DESC LIMIT ? OFFSET ?`,
+                [user.id, ctx.tenantId, limit, offset]
+            ) as any;
             if (!history.length) return ctx.reply(i18n.t(lang, 'history_empty'));
 
             let msg = `${i18n.t(lang, 'history_title')}\n`;
@@ -1941,25 +1994,16 @@ class TelegramService {
                     msg += `<tg-emoji emoji-id="6084365261241062593">📝</tg-emoji> ${t.description}\n`;
                 } else {
                     // Parse payment code từ note: "Mua X x Product [CODE]" (bot) hoặc "Mua X x Product @ price (API)"
-                    const codeMatch = t.description.match(/\[([A-Z0-9]{4,8})\]$/);
-                    const displayCode = codeMatch ? codeMatch[1] : null;
+                    const codeMatch = t.description.match(/\[([A-Z0-9]{4,16})\]$/);
+                    const displayCode = codeMatch ? codeMatch[1] : (t.order_code || null);
                     // Xóa suffix [CODE] hoặc @ price... (API format)
-                    const cleanDesc = t.description.replace(/\s*\[[A-Z0-9]{4,8}\]$/, '').replace(/\s*@[\s\S]*$/, '');
+                    const cleanDesc = t.description.replace(/\s*\[[A-Z0-9]{4,16}\]$/, '').replace(/\s*@[\s\S]*$/, '');
 
                     msg += `<tg-emoji emoji-id="5226929552319594190">🛒</tg-emoji> <b>${sign}${this.fmt(t.amount)}đ</b> | <i>${dateStr}</i>\n`;
                     if (displayCode) {
                         msg += `<tg-emoji emoji-id="5323479695579163583">📑</tg-emoji> <b>Mã đơn:</b> <code>${displayCode}</code>\n`;
                     } else if (t.order_id) {
-                        // Lấy order code từ DB nếu không parse được từ note
-                        try {
-                            const [orderCodeRows]: any = await pool.execute(`SELECT code FROM telehub_orders WHERE id = ? LIMIT 1`, [t.order_id]);
-                            const oCode = orderCodeRows?.[0]?.code;
-                            if (oCode) {
-                                msg += `<tg-emoji emoji-id="5323479695579163583">📑</tg-emoji> <b>Mã đơn:</b> <code>${oCode}</code>\n`;
-                            } else {
-                                msg += `<tg-emoji emoji-id="5323479695579163583">📑</tg-emoji> <b>Mã đơn:</b> #${t.order_id}\n`;
-                            }
-                        } catch { msg += `<tg-emoji emoji-id="5323479695579163583">📑</tg-emoji> <b>Mã đơn:</b> #${t.order_id}\n`; }
+                        msg += `<tg-emoji emoji-id="5323479695579163583">📑</tg-emoji> <b>Mã đơn:</b> #${t.order_id}\n`;
                     }
                     const productName = cleanDesc.replace(/^Mua \d+ x /, '');
                     const qtyMatch = cleanDesc.match(/^Mua (\d+) x/);

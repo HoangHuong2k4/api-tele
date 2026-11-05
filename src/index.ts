@@ -14,6 +14,7 @@ import dealerRoutes from './routes/dealer.routes';
 import { bankService } from './services/bank.service';
 import { cryptoService } from './services/crypto.service';
 import { apiProviderService } from './services/api-provider.service';
+import { telegramService } from './services/telegram.service';
 
 dotenv.config();
 
@@ -61,16 +62,16 @@ import adminRoutes from './routes/admin.routes';
 
 // Routes
 app.use('/api/v1/webhooks', webhookRoutes);
-app.post('/api/v1/webhooks/telegram/:tenantId/:tokenHash', async (req, res) => {
-    const { tenantId, tokenHash } = req.params;
-    try {
-        const { telegramService } = await import('./services/telegram.service');
-        await telegramService.handleUpdate(parseInt(tenantId), req.body);
-        res.sendStatus(200);
-    } catch (error) {
+app.post('/api/v1/webhooks/telegram/:tenantId/:tokenHash', (req, res) => {
+    const { tenantId } = req.params;
+    res.sendStatus(200);
+    telegramService.handleUpdate(parseInt(tenantId), req.body).catch((error: any) => {
+        const desc = error?.response?.description || error?.message || '';
+        if (desc.includes('message is not modified') || desc.includes('query is too old')) {
+            return;
+        }
         console.error(`Webhook error for Tenant ${tenantId}:`, error);
-        res.sendStatus(500);
-    }
+    });
 });
 app.use('/api/v1/auth', authRoutes);
 app.post('/api/v1/internal/restart', (req, res) => {
