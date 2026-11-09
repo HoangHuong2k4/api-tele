@@ -140,7 +140,7 @@ class ApiProviderService {
                 if (typeof apiProd.price === 'object' && apiProd.price !== null) {
                     costPrice = parseFloat(apiProd.price.amount || apiProd.price.value || 0);
                 } else {
-                    costPrice = parseFloat(apiProd.price || apiProd.cost_price || 0);
+                    costPrice = parseFloat(apiProd.price || apiProd.price_vnd || apiProd.cost_price || 0);
                 }
 
                 const isAvailable = (apiProd.available !== false && apiProd.available !== 0 && apiProd.status !== 'inactive' && apiProd.status !== 0);
@@ -158,46 +158,17 @@ class ApiProviderService {
                 }
                 const deliveryMode = apiProd.delivery_mode || apiProd.productType || apiProd.type || 'instant_items';
 
-                // Kiểm tra xem sản phẩm có vừa lên hàng (từ hết hàng 0 lên >0) để thông báo
+                // Lấy trạng thái tồn kho cũ trước khi cập nhật để kiểm tra lên hàng
+                let existingProds: any[] = [];
                 try {
-                    const [existingProds]: any = await pool.execute(
-                        `SELECT id, tenant_id, name, price, api_stock FROM ${TABLES.PRODUCTS}
+                    const [rows]: any = await pool.execute(
+                        `SELECT id, tenant_id, name, icon, price, duration_days, warranty_unit, api_stock, status FROM ${TABLES.PRODUCTS}
                          WHERE api_provider_id = ? AND api_product_id = ? AND is_api_product = 1`,
                         [provider.id, apiProdId]
                     );
-
-                    if (existingProds && existingProds.length > 0) {
-                        for (const prod of existingProds) {
-                            const oldStock = prod.api_stock || 0;
-                            if (oldStock <= 0 && stockCount > 0) {
-                                logger.info(`[ApiProviderSync] Sản phẩm #${prod.id} (${prod.name}) VỪA LÊN HÀNG: kho cũ ${oldStock} -> mới ${stockCount}`);
-                                const { telegramService } = await import('./telegram.service');
-                                const restockMsg = `🎉 <b>THÔNG BÁO LÊN HÀNG (RESTOCK)</b>\n\n` +
-                                    `🛍️ <b>Sản phẩm:</b> ${prod.name}\n` +
-                                    `📦 <b>Số lượng kho mới:</b> <code>${stockCount}</code>\n` +
-                                    `💰 <b>Giá bán:</b> <code>${Number(prod.price).toLocaleString()}đ</code>\n` +
-                                    `🏪 <b>Kho sỉ:</b> ${provider.name || 'API Partner'}\n\n` +
-                                    `👉 Đã cập nhật trên bot, khách hàng có thể mua ngay!`;
-                                await telegramService.notifyAdmin(prod.tenant_id, restockMsg);
-
-                                // Nếu có kênh thông báo bán hàng (telegram_sales_id), gửi tiếp vào kênh
-                                const [cfgRows]: any = await pool.execute(
-                                    `SELECT telegram_sales_id, bot_token FROM ${TABLES.BOT_CONFIGS} WHERE tenant_id = ? LIMIT 1`,
-                                    [prod.tenant_id]
-                                );
-                                const salesChannel = cfgRows?.[0]?.telegram_sales_id;
-                                if (salesChannel && cfgRows?.[0]?.bot_token) {
-                                    axios.post(`https://api.telegram.org/bot${cfgRows[0].bot_token}/sendMessage`, {
-                                        chat_id: salesChannel,
-                                        text: restockMsg,
-                                        parse_mode: 'HTML'
-                                    }).catch((e: any) => logger.warn(`[ApiProviderSync] Không thể gửi vào channel ${salesChannel}: ${e.message}`));
-                                }
-                            }
-                        }
-                    }
-                } catch (notifErr: any) {
-                    logger.warn(`[ApiProviderSync] Kiểm tra thông báo lên hàng thất bại: ${notifErr.message}`);
+                    existingProds = rows || [];
+                } catch (qErr: any) {
+                    logger.warn(`[ApiProviderSync] Lỗi truy vấn sản phẩm hiện tại: ${qErr.message}`);
                 }
 
                 // Cập nhật telehub_products cho tất cả sản phẩm đang liên kết với api_product_id này
@@ -216,6 +187,64 @@ class ApiProviderService {
                      WHERE api_provider_id = ? AND api_product_id = ? AND is_api_product = 1`,
                     [stockCount, soldCount, soldCount, costPrice, deliveryMode, costPrice, provider.id, apiProdId]
                 );
+
+                // Kiểm tra nếu sản phẩm đang bật bán (published) và số lượng kho mới > kho hiện tại thì báo lên hàng như Import Tele
+                try {
+                    if (existingProds.length > 0) {
+                        for (const prod of existingProds) {
+                            const oldStock = parseInt(prod.api_stock || 0);
+                            if (prod.status === 'published' && stockCount > oldStock && deliveryMode !== 'account_upgrade') {
+                                const addedQty = stockCount - oldStock;
+                                logger.info(`[ApiProviderSync] Sản phẩm #${prod.id} (${prod.name}) VỪA LÊN HÀNG: kho cũ ${oldStock} -> mới ${stockCount} (+${addedQty})`);
+
+                                // 1. Thông báo cho Admin
+                                const restockMsg = `🎉 <b>THÔNG BÁO LÊN HÀNG (RESTOCK)</b>\n\n` +
+                                    `🛍️ <b>Sản phẩm:</b> ${prod.name}\n` +
+                                    `➕ <b>Vừa thêm:</b> <code>+${addedQty}</code>\n` +
+                                    `📦 <b>Số lượng kho mới:</b> <code>${stockCount}</code>\n` +
+                                    `💰 <b>Giá bán:</b> <code>${Number(prod.price).toLocaleString()}đ</code>\n` +
+                                    `🏪 <b>Kho sỉ:</b> ${provider.name || 'API Partner'}\n\n` +
+                                    `👉 Đã tự động phát thông báo có hàng mới tới khách hàng trên Bot bán hàng!`;
+                                await telegramService.notifyAdmin(prod.tenant_id, restockMsg);
+
+                                // 2. Broadcast thông báo lên hàng về Bot bán hàng cho khách (giống hệt ProductItemImporter)
+                                const warrantyUnit = prod.warranty_unit || 'day';
+                                const warrantyText = !prod.duration_days
+                                    ? 'Không bảo hành'
+                                    : (warrantyUnit === 'hour'
+                                        ? `${prod.duration_days}H`
+                                        : (Number(prod.duration_days) === 1 ? '24h' : `${prod.duration_days} ngày`));
+
+                                const iconPrefix = prod.icon ? `${String(prod.icon).trim()} ` : '';
+                                const customerMessage =
+                                    `[5458603043203327669][5458603043203327669]<b>Thống báo có hàng mới</b>[5458603043203327669][5458603043203327669]\n` +
+                                    `${iconPrefix}<b>${prod.name}</b>\n` +
+                                    `🛡 <b>Bảo hành: ${warrantyText}</b>\n` +
+                                    `[5397916757333654639] <b>Vừa thêm: ${addedQty}</b>\n` +
+                                    `[5278467510604160626] <b>Kho hiện tại: ${stockCount}</b>\n`;
+
+                                const replyMarkup = {
+                                    inline_keyboard: [
+                                        [
+                                            { text: '🛒 Mua ngay', callback_data: `buy_${prod.id}` }
+                                        ]
+                                    ]
+                                };
+
+                                telegramService.broadcastNotification(
+                                    prod.tenant_id,
+                                    customerMessage,
+                                    null,
+                                    replyMarkup
+                                ).catch((err: any) => {
+                                    logger.error(`[ApiProviderSync] Lỗi broadcast lên hàng cho SP #${prod.id}: ${err.message}`);
+                                });
+                            }
+                        }
+                    }
+                } catch (notifErr: any) {
+                    logger.warn(`[ApiProviderSync] Kiểm tra thông báo lên hàng thất bại: ${notifErr.message}`);
+                }
 
                 if (updateResult.affectedRows > 0) {
                     updatedCount += updateResult.affectedRows;
@@ -242,6 +271,16 @@ class ApiProviderService {
                         balance = balData.balance_remaining;
                     } else if (typeof balData.balanceVnd !== 'undefined') {
                         balance = balData.balanceVnd;
+                    } else if (typeof balData.balance_vnd !== 'undefined' || typeof balData.balance_usdt !== 'undefined') {
+                        const bVnd = parseFloat(balData.balance_vnd || 0);
+                        const bUsdt = parseFloat(balData.balance_usdt || 0);
+                        if (bVnd <= 0 && bUsdt > 0) {
+                            balance = bUsdt;
+                            await pool.execute(`UPDATE ${TABLES.API_PROVIDERS} SET currency = 'USDT' WHERE id = ?`, [provider.id]);
+                        } else {
+                            balance = bVnd;
+                            await pool.execute(`UPDATE ${TABLES.API_PROVIDERS} SET currency = 'VND' WHERE id = ?`, [provider.id]);
+                        }
                     } else if (typeof balData.amount !== 'undefined') {
                         balance = balData.amount;
                     } else if (typeof balData.new_balance !== 'undefined') {

@@ -2248,12 +2248,16 @@ class TelegramService {
                 }
 
                 let apiResp: any = null;
+                const parsedApiProductId = (provider.base_url.includes('tunvnmmo') && /^\d+$/.test(String(product.api_product_id)))
+                    ? parseInt(String(product.api_product_id), 10)
+                    : product.api_product_id;
                 const reqBody: Record<string, any> = {
-                    product_id: product.api_product_id,
+                    product_id: parsedApiProductId,
                     product_name: product.api_product_id,
                     product_key: product.api_product_id, // Lay2FA CTV API
                     quantity: totalAccNeeded,
                     qty: totalAccNeeded, // Lay2FA CTV API
+                    currency: String(provider.currency || 'vnd').toLowerCase() === 'usdt' ? 'usdt' : 'vnd', // TunVN API
                     partner_ref: orderCode,
                     request_id: orderCode,
                     order_code: orderCode, // Lay2FA CTV API
@@ -2355,9 +2359,9 @@ class TelegramService {
                 }
 
                 const respData = apiResp.data.data || apiResp.data.order || apiResp.data;
-                const apiOrderCode = respData.job_id || apiResp.data.job_id || respData.order_code || respData.orderCode || apiResp.data.order?.orderCode || respData.order_id || respData.id || respData.request_id || null;
+                const apiOrderCode = respData.job_id || apiResp.data.job_id || respData.order_group || apiResp.data.order?.order_group || respData.order_code || respData.orderCode || apiResp.data.order?.orderCode || respData.order_id || respData.id || respData.request_id || null;
                 const apiStatus = respData.status || apiResp.data.order?.status || 'done';
-                const apiItemsRaw = apiResp.data.delivery?.accounts || respData.delivery?.accounts || respData.items || respData.accounts || respData.cards || [];
+                const apiItemsRaw = apiResp.data.delivery?.accounts || respData.delivery?.accounts || apiResp.data.items || respData.items || apiResp.data.accounts || respData.accounts || respData.cards || [];
                 const results: string[] = [];
 
                 if (respData.job_id || apiResp.data.job_id) {
@@ -2409,7 +2413,7 @@ class TelegramService {
                     [tenantId, order.insertId, productId, totalAccNeeded, activePrice, comboId || null, bonusQty || null]
                 );
 
-                const balanceAfter = apiResp.data.credit ?? respData.credit ?? apiResp.data.balance_remaining ?? respData.balance_remaining ?? apiResp.data.payment?.balance ?? respData.payment?.balance ?? respData.balance ?? respData.new_balance;
+                const balanceAfter = apiResp.data.credit ?? respData.credit ?? apiResp.data.new_balance ?? respData.new_balance ?? apiResp.data.balance_remaining ?? respData.balance_remaining ?? apiResp.data.payment?.balance ?? respData.payment?.balance ?? respData.balance;
                 if (balanceAfter !== undefined && balanceAfter !== null) {
                     await conn.execute(
                         `UPDATE ${TABLES.API_PROVIDERS} SET balance = ? WHERE id = ?`,
