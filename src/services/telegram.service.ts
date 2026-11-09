@@ -41,7 +41,7 @@ class TelegramService {
     private userStates: Map<string, UserState> = new Map();
     private userCredentials: Map<string, string> = new Map();
     private configCache: Map<number, { data: any, expiresAt: number }> = new Map();
-    private registeredUsersCache: Map<string, { sig: string, expiresAt: number }> = new Map();
+    private registeredUsersCache: Map<string, { sig: string, expiresAt: number, isBanned: boolean, banCheckedAt: number }> = new Map();
 
     // Consolidated UI Elements
     private readonly UI = {
@@ -198,7 +198,7 @@ class TelegramService {
             return next();
         });
 
-        // Auto-register user on first contact (with 10-minute in-memory cache so subsequent clicks don't block on DB write)
+        // Auto-register user on first contact & enforce ban status
         bot.use(async (ctx: any, next) => {
             if (ctx.from?.id) {
                 const fullName = ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '');
@@ -207,23 +207,56 @@ class TelegramService {
                 const cacheKey = `${ctx.tenantId}_${telegramId}`;
                 const sig = `${fullName}|${username}`;
                 const now = Date.now();
-                const cachedUser = this.registeredUsersCache.get(cacheKey);
+                let cachedUser = this.registeredUsersCache.get(cacheKey);
 
-                const upsertSql = `INSERT INTO ${TABLES.CUSTOMERS} (tenant_id, telegram_id, full_name, username, balance, status, created_at, updated_at)
-                         VALUES (?, ?, ?, ?, 0, 'published', NOW(), NOW())
-                         ON DUPLICATE KEY UPDATE full_name = VALUES(full_name), username = VALUES(username), status = 'published', updated_at = NOW()`;
+                const upsertSql = `INSERT INTO ${TABLES.CUSTOMERS} (tenant_id, telegram_id, full_name, username, balance, status, is_banned, created_at, updated_at)
+                         VALUES (?, ?, ?, ?, 0, 'published', 0, NOW(), NOW())
+                         ON DUPLICATE KEY UPDATE
+                             full_name = VALUES(full_name),
+                             username = VALUES(username),
+                             status = IF(is_banned = 1, 'draft', 'published'),
+                             updated_at = NOW()`;
 
                 if (!cachedUser || cachedUser.sig !== sig) {
                     try {
                         await pool.execute(upsertSql, [ctx.tenantId, telegramId, fullName, username]);
+                        const [banRows]: any = await pool.execute(
+                            `SELECT is_banned FROM ${TABLES.CUSTOMERS} WHERE tenant_id = ? AND telegram_id = ? LIMIT 1`,
+                            [ctx.tenantId, telegramId]
+                        );
+                        const isBanned = Boolean(banRows?.[0]?.is_banned);
                         if (this.registeredUsersCache.size > 10000) this.registeredUsersCache.clear();
-                        this.registeredUsersCache.set(cacheKey, { sig, expiresAt: now + 10 * 60 * 1000 });
+                        cachedUser = { sig, expiresAt: now + 10 * 60 * 1000, isBanned, banCheckedAt: now };
+                        this.registeredUsersCache.set(cacheKey, cachedUser);
                     } catch (err: any) {
                         logger.error(`[Tenant #${ctx.tenantId}] auto-reg error: ${err.message}`);
                     }
-                } else if (cachedUser.expiresAt < now) {
-                    cachedUser.expiresAt = now + 10 * 60 * 1000;
-                    pool.execute(upsertSql, [ctx.tenantId, telegramId, fullName, username]).catch(() => {});
+                } else {
+                    if (cachedUser.expiresAt < now) {
+                        cachedUser.expiresAt = now + 10 * 60 * 1000;
+                        pool.execute(upsertSql, [ctx.tenantId, telegramId, fullName, username]).catch(() => {});
+                    }
+                    if (cachedUser.banCheckedAt + 5000 < now) {
+                        try {
+                            const [banRows]: any = await pool.execute(
+                                `SELECT is_banned FROM ${TABLES.CUSTOMERS} WHERE tenant_id = ? AND telegram_id = ? LIMIT 1`,
+                                [ctx.tenantId, telegramId]
+                            );
+                            cachedUser.isBanned = Boolean(banRows?.[0]?.is_banned);
+                            cachedUser.banCheckedAt = now;
+                        } catch {}
+                    }
+                }
+
+                // Chặn hoàn toàn nếu user nằm trong danh sách đen (is_banned = 1)
+                if (cachedUser?.isBanned) {
+                    logger.warn(`[Tenant #${ctx.tenantId}] 🚫 Banned user @${username} (${telegramId}) blocked from bot interaction`);
+                    if (ctx.callbackQuery) {
+                        await ctx.answerCbQuery('🚫 Tài khoản của bạn đã bị chặn khỏi hệ thống.', { show_alert: true }).catch(() => {});
+                    } else if (ctx.message) {
+                        await ctx.reply('🚫 <b>Tài khoản của bạn đã bị chặn khỏi hệ thống do vi phạm chính sách.</b>', { parse_mode: 'HTML' }).catch(() => {});
+                    }
+                    return;
                 }
 
                 // Activity tracking (hourly bucket) — fire-and-forget so it never slows the bot down
@@ -2786,7 +2819,7 @@ class TelegramService {
 
         const formattedMessage = this.formatPremiumEmoji(message);
         const [customers]: any = await pool.execute(
-            `SELECT id, telegram_id FROM ${TABLES.CUSTOMERS} WHERE tenant_id = ? AND status = "published"`,
+            `SELECT id, telegram_id FROM ${TABLES.CUSTOMERS} WHERE tenant_id = ? AND status = "published" AND (is_banned = 0 OR is_banned IS NULL)`,
             [tenantId]
         );
 

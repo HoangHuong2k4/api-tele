@@ -16,7 +16,7 @@ const authenticateApiKey = async (req: express.Request, res: express.Response, n
         const [rows]: any = await pool.execute(`
             SELECT id, tenant_id, full_name, balance, is_dealer 
             FROM ${TABLES.CUSTOMERS} 
-            WHERE api_key = ? AND is_dealer = 1
+            WHERE api_key = ? AND is_dealer = 1 AND (is_banned = 0 OR is_banned IS NULL)
         `, [apiKey]);
 
         if (rows.length === 0) {
